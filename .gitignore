@@ -1,0 +1,15 @@
+
+# Archivos temporales y caché de Visual Studio
+.vs/
+
+# Archivos generados por compilación
+[Bb]in/
+[Oo]bj/
+
+# Archivos de usuario de Visual Studio
+*.user
+*.suo
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
