@@ -4,23 +4,17 @@ using FitExpert.Motor.Modelo;
 namespace FitExpert.Motor.Negocio;
 
 /// <summary>
-/// Gestion de la base de conocimiento (CU-04). Valida los cambios antes de
-/// guardarlos para que ninguna hipotesis se quede sin regla.
+/// Gestion de la base de conocimiento (CU-04). Valida los cambios antes de guardarlos.
+/// Las reglas se derivan del arbol de decision, por eso aqui solo se consultan.
 /// </summary>
 public sealed class ServicioConocimiento
 {
-    private const string SinObligatorios =
-        "La hipótesis debe conservar al menos un hecho obligatorio; de lo contrario su regla SI … ENTONCES quedaría vacía.";
-
     private readonly IAdministracionRepository _repositorio;
 
     public ServicioConocimiento(IAdministracionRepository repositorio) => _repositorio = repositorio;
 
     public IReadOnlyList<ReglaDerivada> ListarReglas() => _repositorio.ListarReglas();
     public IReadOnlyList<Hipotesis> ListarHipotesis() => _repositorio.ListarHipotesis();
-    public IReadOnlyList<HechoCatalogo> ListarHechos() => _repositorio.ListarHechos();
-    public IReadOnlyList<VinculoHechoHipotesis> ListarVinculos(int idHipotesis) =>
-        _repositorio.ListarVinculos(idHipotesis);
 
     public ResultadoOperacion ActualizarHipotesis(Hipotesis hipotesis)
     {
@@ -52,36 +46,5 @@ public sealed class ServicioConocimiento
         });
 
         return ResultadoOperacion.Ok($"La hipótesis {hipotesis.Codigo} se actualizó.");
-    }
-
-    public ResultadoOperacion GuardarVinculo(int idHecho, int idHipotesis, decimal peso, bool necesario)
-    {
-        if (peso <= 0m || peso > 1m)
-            return ResultadoOperacion.Falla("El peso debe estar entre 0,01 y 1,00.");
-
-        var actuales = _repositorio.ListarVinculos(idHipotesis);
-        var existente = actuales.FirstOrDefault(v => v.Hecho.IdHecho == idHecho);
-
-        if (!necesario && existente is { Necesario: true } && actuales.Count(v => v.Necesario) == 1)
-            return ResultadoOperacion.Falla(SinObligatorios);
-
-        _repositorio.GuardarVinculo(idHecho, idHipotesis, peso, necesario);
-
-        return ResultadoOperacion.Ok(existente is null ? "Vínculo agregado." : "Vínculo actualizado.");
-    }
-
-    public ResultadoOperacion EliminarVinculo(int idHecho, int idHipotesis)
-    {
-        var actuales = _repositorio.ListarVinculos(idHipotesis);
-        var existente = actuales.FirstOrDefault(v => v.Hecho.IdHecho == idHecho);
-
-        if (existente is null)
-            return ResultadoOperacion.Falla("El vínculo seleccionado ya no existe.");
-
-        if (existente.Necesario && actuales.Count(v => v.Necesario) == 1)
-            return ResultadoOperacion.Falla(SinObligatorios);
-
-        _repositorio.EliminarVinculo(idHecho, idHipotesis);
-        return ResultadoOperacion.Ok("Vínculo eliminado.");
     }
 }

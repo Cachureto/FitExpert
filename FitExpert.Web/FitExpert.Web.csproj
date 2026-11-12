@@ -11,7 +11,6 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />
     <PackageReference Include="Amazon.Lambda.AspNetCoreServer.Hosting" Version="1.7.1" />
-    <PackageReference Include="AWSSDK.BedrockRuntime" Version="4.0.*" />
   </ItemGroup>
 
 </Project>

@@ -15,24 +15,18 @@ public sealed class ServicioRecomendacion
     public ServicioRecomendacion(Func<IConocimientoRepository> crearRepositorio) =>
         _crearRepositorio = crearRepositorio;
 
-    /// <summary>Paso 1: preguntas y hechos para construir el cuestionario.</summary>
-    public IReadOnlyList<Pregunta> ObtenerCuestionario() => _crearRepositorio().ObtenerPreguntas();
+    /// <summary>Arbol de decision que la interfaz recorre pregunta por pregunta.</summary>
+    public ArbolDecision ObtenerArbol() => _crearRepositorio().ObtenerArbol();
 
-    /// <summary>Pasos 2 a 5: inferencia sobre los hechos declarados.</summary>
-    public ResultadoInferencia Evaluar(IEnumerable<Hecho> respuestas)
+    /// <summary>Recorrido del arbol e inferencia sobre los hechos declarados, en orden.</summary>
+    public ResultadoInferencia Evaluar(IReadOnlyList<int> respuestas)
     {
-        var memoria = new MemoriaTrabajo();
-        foreach (var hecho in respuestas)
-            memoria.Registrar(hecho);
+        if (respuestas.Count == 0)
+            throw new RecorridoInvalidoException("Debe responder al menos una pregunta.");
 
-        if (memoria.Hechos.Count == 0)
-            throw new InvalidOperationException("Debe responder al menos una pregunta.");
+        var repositorio = _crearRepositorio();
+        var motor = new MotorInferencia(repositorio, new CalculadorCerteza(), new RedactorReglas());
 
-        var motor = new MotorInferencia(
-            _crearRepositorio(),
-            new CalculadorCerteza(),
-            new RedactorReglas());
-
-        return motor.Ejecutar(memoria);
+        return motor.Ejecutar(repositorio.ObtenerArbol(), respuestas);
     }
 }

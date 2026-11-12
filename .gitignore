@@ -1,0 +1,14 @@
+# Compilacion de .NET (se generan al compilar o publicar)
+bin/
+obj/
+publish/
+*.zip
+
+# Configuracion local con contrasenas o cadenas de conexion
+appsettings.Development.json
+
+# Editores y sistema
+.vs/
+*.user
+.DS_Store
+Thumbs.db

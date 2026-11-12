@@ -1,10 +1,8 @@
 using System.Security.Cryptography;
-using System.Text.Json;
 using Amazon.Lambda.AspNetCoreServer.Hosting;
 using FitExpert.Motor.Datos;
 using FitExpert.Motor.Modelo;
 using FitExpert.Motor.Negocio;
-using FitExpert.Web.IA;
 using FitExpert.Web.Seguridad;
 using Microsoft.Data.SqlClient;
 
@@ -18,7 +16,6 @@ using Microsoft.Data.SqlClient;
 // Rutas
 //   Publicas        /api/salud · /api/auth/login · /api/auth/registro
 //   Usuario final   /api/app/...   (token de cualquier rol)
-//                   /api/app/coach usa Amazon Bedrock para explicar el plan
 //   Administrador   /api/admin/... (token con rol ADMINISTRADOR)
 // =====================================================================
 
@@ -49,11 +46,6 @@ builder.Services.AddSingleton(new ServicioUsuarios(repositorioUsuarios));
 builder.Services.AddSingleton(new ServicioConocimiento(repositorioAdministracion));
 builder.Services.AddSingleton(new EvaluacionRepository(conexion));
 
-// Servicio de IA de la nube: Amazon Bedrock. El modelo se puede cambiar con
-// la variable Bedrock__Modelo (por defecto, Amazon Nova Lite).
-var asesor = new AsesorBedrock(builder.Configuration["Bedrock:Modelo"]);
-builder.Services.AddSingleton(asesor);
-
 builder.Services.AddCors(opciones => opciones.AddDefaultPolicy(politica =>
     politica.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 
@@ -66,7 +58,6 @@ app.UseCors();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-var json = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 var api = app.MapGroup("/api");
 
 api.MapGet("/salud", () => Results.Ok(new
@@ -74,8 +65,7 @@ api.MapGet("/salud", () => Results.Ok(new
     servicio = "FitExpert · Motor de inferencia",
     estado = "en línea",
     baseDeConocimiento = baseConfigurada ? "configurada" : "sin cadena de conexión",
-    firmaDeTokens = claveTemporal ? "temporal" : "configurada",
-    asesorIA = $"Amazon Bedrock · {asesor.Modelo}"
+    firmaDeTokens = claveTemporal ? "temporal" : "configurada"
 }));
 
 // ------------------------------------------------------------ autenticacion
@@ -125,80 +115,46 @@ auth.MapGet("/yo", (HttpContext http) =>
 
 var appUsuario = api.MapGroup("/app").ExigirSesion();
 
-// Paso 1 del motor: preguntas y hechos posibles (tablas Pregunta y Hecho).
-appUsuario.MapGet("/preguntas", (ServicioRecomendacion servicio) => Ejecutar(() =>
-    servicio.ObtenerCuestionario()
-        .Select(p => new PreguntaDto(
-            p.IdPregunta,
-            p.Codigo,
-            p.Texto,
-            p.Obligatoria,
-            p.Opciones.Select(h => new OpcionDto(h.IdHecho, h.Codigo, h.Texto)).ToList()))
-        .ToList()));
+// Arbol de decision (tabla NodoDecision). La interfaz lo recorre nodo por nodo:
+// cada respuesta lleva al nodo hijo hasta llegar a un nodo terminal Hn.
+appUsuario.MapGet("/arbol", (ServicioRecomendacion servicio) => Ejecutar(() => ArbolDto.Desde(servicio.ObtenerArbol())));
 
-// Pasos 2 a 5 del motor: inferencia sobre los hechos declarados.
+// Inferencia sobre el recorrido. Las respuestas deben llegar en el orden del recorrido.
 appUsuario.MapPost("/evaluar", (SolicitudEvaluacion solicitud, HttpContext http, ServicioRecomendacion servicio, EvaluacionRepository evaluaciones) => Ejecutar(() =>
 {
     var sesion = http.SesionActual();
-    var preguntas = servicio.ObtenerCuestionario();
-    var hechosPorId = preguntas.SelectMany(p => p.Opciones).ToDictionary(h => h.IdHecho);
-    var ids = (solicitud.Hechos ?? new List<int>()).Distinct().ToList();
+    var resultado = servicio.Evaluar(solicitud.Hechos ?? new List<int>());
 
-    var desconocidos = ids.Where(id => !hechosPorId.ContainsKey(id)).ToList();
-    if (desconocidos.Count > 0)
-        throw new SolicitudInvalidaException($"Hechos no válidos: {string.Join(", ", desconocidos)}.");
+    var detalles = resultado.Hipotesis.Select(h => new DetalleHipotesis(
+        h.Posicion,
+        h.Hipotesis.IdHipotesis,
+        h.Regla.IdRegla,
+        h.Hipotesis.Codigo,
+        h.Hipotesis.Nombre,
+        h.Hipotesis.Area,
+        h.Hipotesis.Prioridad,
+        Math.Round(h.Peso, 1),
+        Math.Round(h.Cobertura * 100m, 1),
+        Math.Round(h.SoporteNecesario * 100m, 1),
+        h.ConclusionArbol,
+        h.Hipotesis.Rutina,
+        h.Hipotesis.Dieta,
+        h.Regla.Codigo,
+        h.ReglaTexto,
+        h.Explicacion,
+        h.Hipotesis.Aviso)).ToList();
 
-    var hechos = ids.Select(id => hechosPorId[id]).ToList();
-
-    if (hechos.GroupBy(h => h.IdPregunta).Any(g => g.Count() > 1))
-        throw new SolicitudInvalidaException("Solo se admite una respuesta por pregunta.");
-
-    var respondidas = hechos.Select(h => h.IdPregunta).ToHashSet();
-    var faltantes = preguntas
-        .Where(p => p.Obligatoria && !respondidas.Contains(p.IdPregunta))
-        .Select(p => p.Codigo)
-        .ToList();
-
-    if (faltantes.Count > 0)
-        throw new SolicitudInvalidaException($"Faltan respuestas obligatorias: {string.Join(", ", faltantes)}.");
-
-    var resultado = servicio.Evaluar(hechos);
-
-    var respuesta = new RespuestaEvaluacion(
-        0,
-        DateTime.UtcNow,
-        resultado.Evaluadas.Count,
+    // Se guarda la evaluacion, el camino recorrido y el detalle de las 5 hipotesis.
+    var id = evaluaciones.Guardar(
+        sesion.IdUsuario,
+        resultado.Recorrido.Terminal.IdNodo,
+        resultado.HipotesisEvaluadas,
         resultado.ConsultasEjecutadas,
-        hechos.Select(h => h.Enunciado).ToList(),
-        resultado.Hipotesis.Select(h => new HipotesisDto(
-            h.Posicion,
-            h.Hipotesis.Codigo,
-            h.Hipotesis.Nombre,
-            h.Hipotesis.Area,
-            h.Hipotesis.Prioridad,
-            Math.Round(h.Peso, 1),
-            Math.Round(h.Cobertura * 100m, 0),
-            Math.Round(h.SoporteNecesario * 100m, 0),
-            h.Hipotesis.Rutina,
-            h.Hipotesis.Dieta,
-            h.Regla,
-            h.Explicacion)).ToList());
+        resultado.Recorrido.Pasos.Select(p => new RespuestaAGuardar(p.Paso, p.Nodo.IdNodo, p.Respuesta.IdHecho)).ToList(),
+        detalles);
 
-    // Se guarda en el historial del usuario con su recomendacion principal.
-    var principal = respuesta.Hipotesis.FirstOrDefault();
-    if (principal is not null)
-    {
-        var id = evaluaciones.Guardar(
-            sesion.IdUsuario,
-            principal.Codigo,
-            principal.Nombre,
-            principal.Peso,
-            JsonSerializer.Serialize(respuesta, json));
-
-        respuesta = respuesta with { IdEvaluacion = id };
-    }
-
-    return respuesta;
+    return evaluaciones.Obtener(id, sesion.IdUsuario)
+        ?? throw new SolicitudInvalidaException("No fue posible leer la evaluación guardada.");
 }));
 
 // Historial del usuario.
@@ -206,49 +162,13 @@ appUsuario.MapGet("/evaluaciones", (HttpContext http, EvaluacionRepository evalu
     evaluaciones.ListarPorUsuario(http.SesionActual().IdUsuario)));
 
 appUsuario.MapGet("/evaluaciones/{id:int}", (int id, HttpContext http, EvaluacionRepository evaluaciones) => Ejecutar(() =>
-{
-    var guardado = evaluaciones.ObtenerResultado(id, http.SesionActual().IdUsuario)
-        ?? throw new SolicitudInvalidaException("La evaluación no existe.");
+    evaluaciones.Obtener(id, http.SesionActual().IdUsuario)
+        ?? throw new SolicitudInvalidaException("La evaluación no existe.")));
 
-    using var documento = JsonDocument.Parse(guardado);
-    var raiz = documento.RootElement.Clone();
-    return raiz;
-}));
-
-// Coach de IA: Amazon Bedrock explica y organiza el plan que ya calculo el motor.
-appUsuario.MapPost("/coach", async (SolicitudCoach solicitud, HttpContext http, EvaluacionRepository evaluaciones, AsesorBedrock coach, CancellationToken cancelacion) =>
-{
-    if (!baseConfigurada)
-        return Results.Problem(title: "La base de conocimiento no está configurada.", statusCode: StatusCodes.Status503ServiceUnavailable);
-
-    var pregunta = solicitud.Pregunta?.Trim();
-    if (pregunta is { Length: > 300 })
-        return Results.BadRequest(new { error = "La pregunta admite hasta 300 caracteres." });
-
-    string? guardado;
-    try
-    {
-        guardado = evaluaciones.ObtenerResultado(solicitud.IdEvaluacion, http.SesionActual().IdUsuario);
-    }
-    catch (SqlException error)
-    {
-        return Results.Problem(title: "No fue posible consultar la base de conocimiento en Amazon RDS.", detail: error.Message, statusCode: StatusCodes.Status503ServiceUnavailable);
-    }
-
-    if (guardado is null)
-        return Results.BadRequest(new { error = "La evaluación no existe." });
-
-    try
-    {
-        var respuesta = await coach.ConsultarAsync(AsesorBedrock.ResumirResultado(guardado), pregunta, cancelacion);
-        return Results.Ok(new RespuestaCoach(respuesta, coach.Modelo));
-    }
-    catch (Exception error) when (error is not OperationCanceledException)
-    {
-        app.Logger.LogError(error, "Error al consultar Amazon Bedrock");
-        return Results.Json(new { error = coach.DescribirError(error) }, statusCode: StatusCodes.Status503ServiceUnavailable);
-    }
-});
+// Detalle de una de las 5 hipotesis (tabla DetalleHipotesis): rutina, dieta, regla y explicacion.
+appUsuario.MapGet("/evaluaciones/{id:int}/hipotesis/{posicion:int}", (int id, int posicion, HttpContext http, EvaluacionRepository evaluaciones) => Ejecutar(() =>
+    evaluaciones.ObtenerDetalle(id, http.SesionActual().IdUsuario, posicion)
+        ?? throw new SolicitudInvalidaException("La hipótesis solicitada no existe en esta evaluación.")));
 
 // ------------------------------------------------------------ administrador
 
@@ -260,6 +180,8 @@ admin.MapGet("/resumen", (EvaluacionRepository evaluaciones) => Ejecutar(() => e
 admin.MapGet("/reglas", (ServicioConocimiento conocimiento) => Ejecutar(() => conocimiento.ListarReglas()));
 
 admin.MapGet("/hipotesis", (ServicioConocimiento conocimiento) => Ejecutar(() => conocimiento.ListarHipotesis()));
+
+admin.MapGet("/arbol", (ServicioRecomendacion servicio) => Ejecutar(() => ArbolDto.Desde(servicio.ObtenerArbol())));
 
 admin.MapPut("/hipotesis/{id:int}", (int id, SolicitudHipotesis solicitud, ServicioConocimiento conocimiento) => Ejecutar(() =>
 {
@@ -273,6 +195,7 @@ admin.MapPut("/hipotesis/{id:int}", (int id, SolicitudHipotesis solicitud, Servi
         Area        = actual.Area,
         Nombre      = solicitud.Nombre ?? "",
         Prioridad   = solicitud.Prioridad,
+        Aviso       = actual.Aviso,
         Rutina      = solicitud.Rutina ?? "",
         Dieta       = solicitud.Dieta ?? ""
     });
@@ -348,6 +271,10 @@ IResult Ejecutar<T>(Func<T> accion)
     {
         return Results.BadRequest(new { error = error.Message });
     }
+    catch (RecorridoInvalidoException error)
+    {
+        return Results.BadRequest(new { error = error.Message });
+    }
     catch (SqlException error)
     {
         return Results.Problem(
@@ -365,38 +292,35 @@ public sealed record SolicitudEvaluacion(List<int>? Hechos);
 public sealed record SolicitudHipotesis(string? Nombre, int Prioridad, string? Rutina, string? Dieta);
 public sealed record SolicitudNuevoUsuario(string? NombreCompleto, string? Usuario, string? Clave, string? Rol);
 public sealed record SolicitudEstado(bool Activo);
-public sealed record SolicitudCoach(int IdEvaluacion, string? Pregunta);
-public sealed record RespuestaCoach(string Respuesta, string Modelo);
-
 public sealed record UsuarioSesionDto(int IdUsuario, string Usuario, string NombreCompleto, string Rol);
 public sealed record SesionDto(string Token, DateTimeOffset Expira, UsuarioSesionDto Usuario);
 public sealed record UsuarioAdminDto(int IdUsuario, string Usuario, string NombreCompleto, string Rol, bool Activo, DateTime FechaCreacion, DateTime? UltimoAcceso);
 public sealed record MensajeDto(string Mensaje);
 
-public sealed record OpcionDto(int IdHecho, string Codigo, string Texto);
-public sealed record PreguntaDto(int IdPregunta, string Codigo, string Texto, bool Obligatoria, List<OpcionDto> Opciones);
+public sealed record OpcionDto(int IdHecho, string Codigo, string Texto, int IdNodoDestino);
+public sealed record PreguntaNodoDto(string Codigo, string Texto, string? Ayuda);
+public sealed record HipotesisNodoDto(string Codigo, string Nombre, string Area, string? Aviso);
+public sealed record NodoDto(int IdNodo, string Codigo, string Tipo, PreguntaNodoDto? Pregunta, List<OpcionDto> Opciones, HipotesisNodoDto? Hipotesis);
 
-public sealed record HipotesisDto(
-    int Posicion,
-    string Codigo,
-    string Nombre,
-    string Area,
-    int Prioridad,
-    decimal Peso,
-    decimal Cobertura,
-    decimal HechosObligatorios,
-    string Rutina,
-    string Dieta,
-    string Regla,
-    string Explicacion);
-
-public sealed record RespuestaEvaluacion(
-    int IdEvaluacion,
-    DateTime Fecha,
-    int HipotesisEvaluadas,
-    int ConsultasEjecutadas,
-    List<string> HechosDeclarados,
-    List<HipotesisDto> Hipotesis);
+public sealed record ArbolDto(int Raiz, List<NodoDto> Nodos)
+{
+    public static ArbolDto Desde(ArbolDecision arbol) => new(
+        arbol.Raiz.IdNodo,
+        arbol.Nodos.Select(n => new NodoDto(
+            n.IdNodo,
+            n.Codigo,
+            n.EsTerminal ? "TERMINAL" : "DECISION",
+            n.Pregunta is null ? null : new PreguntaNodoDto(n.Pregunta.Codigo, n.Pregunta.Texto, n.Pregunta.Ayuda),
+            n.Pregunta is null
+                ? new List<OpcionDto>()
+                : n.Pregunta.Opciones
+                    .Select(o => (Opcion: o, Destino: arbol.Hijo(n, o.IdHecho)))
+                    .Where(x => x.Destino is not null)
+                    .Select(x => new OpcionDto(x.Opcion.IdHecho, x.Opcion.Codigo, x.Opcion.Texto, x.Destino!.IdNodo))
+                    .ToList(),
+            n.Hipotesis is null ? null : new HipotesisNodoDto(n.Hipotesis.Codigo, n.Hipotesis.Nombre, n.Hipotesis.Area, n.Hipotesis.Aviso)))
+        .ToList());
+}
 
 public sealed class SolicitudInvalidaException(string mensaje) : Exception(mensaje);
 public sealed class AccesoDenegadoException(string mensaje) : Exception(mensaje);

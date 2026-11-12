@@ -5,7 +5,7 @@ Arquitectura de la solución:
 ```
 Navegador (interfaz web)  ──HTTPS──►  AWS Lambda + URL de función  ──SQL──►  Amazon RDS for SQL Server (Express)
    wwwroot/index.html                   FitExpert.Web: API REST y motor          Pregunta · Hecho · Hipotesis
-                                        de inferencia en C# (.NET 10)            HechoHipotesis · vw_Reglas
+                                        de inferencia en C# (.NET 10)            NodoDecision · Regla · CondicionRegla
 ```
 
 Costos: Lambda está dentro de su capa siempre gratuita. RDS se paga con los créditos de bienvenida
@@ -31,7 +31,7 @@ En la consola, abrir el menú **Services → Machine Learning / Artificial Intel
 
 | Servicio | Para qué sirve |
 |---|---|
-| Amazon Bedrock | Modelos fundacionales, agentes y bases de conocimiento. **Es el servicio que usamos** para el coach de IA (paso 3E) |
+| Amazon Bedrock | Modelos fundacionales, agentes y bases de conocimiento |
 | Bedrock Guardrails · Automated Reasoning checks | Verifica respuestas con reglas lógicas formales (lo más cercano a un sistema experto) |
 | Amazon SageMaker AI | Entrenar y publicar modelos propios |
 | Amazon Lex | Chatbots con intenciones y reglas de diálogo |
@@ -74,7 +74,8 @@ como API REST en **AWS Lambda**. Es el modelo de *sistema experto como servicio*
    - Authentication: **SQL Server Authentication** · Login `admin` y tu contraseña
    - Encryption: **Mandatory** y marcar **Trust server certificate**
 7. Abrir `FitExpertDB_AWS.sql` y ejecutar con **F5**. El script crea la base `FitExpertDB`.
-8. Verificar: 9 preguntas, 32 hechos, 26 hipótesis, 90 asociaciones y la lista de reglas.
+8. Verificar: 9 preguntas, 27 hechos, 26 hipótesis, 40 nodos del árbol (13 de decisión y 27 terminales),
+   27 reglas y la consulta de coherencia del árbol **sin filas** (si devuelve filas, el árbol tiene una rama mal cargada).
 
 Cadena de conexión para los pasos siguientes (reemplaza ENDPOINT y la contraseña):
 
@@ -89,7 +90,7 @@ Server=ENDPOINT,1433;Database=FitExpertDB;User ID=admin;Password=CONTRASEÑA;Enc
 2. Visual Studio 2026: clic derecho sobre la solución → **Agregar** → **Proyecto existente** → `FitExpert.Web.csproj`.
 3. Pegar la cadena de conexión en `appsettings.Development.json`.
 4. Clic derecho sobre `FitExpert.Web` → **Establecer como proyecto de inicio** → **F5**.
-5. Se abre el navegador con la interfaz: responder el cuestionario y generar la recomendación.
+5. Se abre el navegador con la interfaz: recorrer el árbol de decisión pregunta por pregunta y generar la recomendación.
 
 > No subas `appsettings.Development.json` a GitHub: contiene la contraseña.
 
@@ -131,7 +132,8 @@ La interfaz ahora es una app de entrenamiento con dos modalidades de ingreso:
 Los usuarios finales pueden crear su propia cuenta desde la pantalla de ingreso.
 
 **1. Agregar las tablas nuevas a RDS.** En SSMS, conectado a RDS, abrir `FitExpert_Login_AWS.sql` y ejecutar
-con **F5**. Crea las tablas `Usuario` y `Evaluacion` sin tocar la base de conocimiento.
+con **F5**. Recrea las tablas `Usuario`, `Evaluacion`, `EvaluacionRespuesta` y `DetalleHipotesis` sin tocar la
+base de conocimiento. (Si ya ejecutaste `FitExpertDB_AWS.sql` completo, este paso no hace falta.)
 
 **2. Crear la clave de los tokens.** El inicio de sesión usa tokens JWT firmados. Inventa una clave larga
 (mínimo 32 caracteres), por ejemplo `FitExpert-UMB-2026-clave-secreta-para-tokens`.
@@ -163,48 +165,29 @@ Rutas del servicio en esta versión:
 | Ruta | Acceso |
 |---|---|
 | `POST /api/auth/login` · `POST /api/auth/registro` · `GET /api/salud` | Público |
-| `GET /api/app/preguntas` · `POST /api/app/evaluar` · `GET /api/app/evaluaciones` | Cualquier sesión |
-| `GET /api/admin/resumen` · `/reglas` · `/hipotesis` · `/usuarios` | Solo administrador |
+| `GET /api/app/arbol` · `POST /api/app/evaluar` · `GET /api/app/evaluaciones` · `GET /api/app/evaluaciones/{id}/hipotesis/{posicion}` | Cualquier sesión |
+| `GET /api/admin/resumen` · `/arbol` · `/reglas` · `/hipotesis` · `/usuarios` | Solo administrador |
 
-## Paso 3E. Servicio de IA: coach con Amazon Bedrock
+## Paso 3E. Árbol de decisión y detalle de hipótesis (versión 3)
 
-En la pantalla **Mi plan** aparece **FitCoach**, un asistente de IA hecho con **Amazon Bedrock** y el modelo
-**Amazon Nova Lite**. El sistema experto sigue decidiendo: el motor elige la hipótesis con sus reglas y pesos,
-y Bedrock solo recibe ese resultado para explicarlo, organizarlo en una semana y responder preguntas sobre él,
-sin cambiarlo. Es un sistema híbrido: razonamiento con reglas más IA generativa.
+FitExpert es un **sistema experto basado en reglas**: todas sus salidas salen de la base de conocimiento.
+No usa modelos de lenguaje ni servicios de IA generativa (se retiró el coach con Amazon Bedrock).
 
-**1. Probar Bedrock en la consola** (además, es una de las actividades que suman créditos):
-Consola → **Amazon Bedrock** → **Playgrounds** → **Chat / Text** → elegir **Amazon Nova Lite** → escribir
-cualquier pregunta → **Ejecutar**. Los modelos de Amazon ya vienen habilitados; no hay que pedir acceso.
+- **La evaluación recorre el árbol de decisión.** La interfaz lee la tabla `NodoDecision` y muestra solo la
+  pregunta del nodo actual; cada respuesta lleva al nodo hijo hasta un nodo terminal (H1 a H26). Por ejemplo,
+  si en *¿Presenta alguna condición de riesgo?* se responde **Sí**, la siguiente pregunta es *¿Qué tipo de
+  condición presenta?*, y el recorrido termina en H1, H2 o H3. El servicio rechaza cualquier recorrido que no
+  siga una rama del árbol.
+- **Las reglas salen del árbol.** Cada nodo terminal tiene su regla en `Regla` (R01 a R27) y su parte SI en
+  `CondicionRegla`, que el script calcula a partir del camino del árbol. Así el árbol, las reglas y la
+  navegación no pueden diferir.
+- **Detalle de las 5 hipótesis.** Al evaluar, el motor ordena las hipótesis por su puntuación (granularidad):
+  la primera es la conclusión del árbol y las otras cuatro son las alternativas más compatibles. El detalle de
+  cada una (rutina, dieta, regla y explicación) se guarda en la tabla `DetalleHipotesis`, y es lo que se
+  consulta al dar clic en una hipótesis en **Mi plan**.
 
-**2. Dar permiso a la función Lambda:**
-1. Lambda → `fitexpert` → **Configuración** → **Permisos** → clic en el **Nombre del rol** (abre IAM).
-2. **Agregar permisos** → **Crear política insertada** → pestaña **JSON** → pegar:
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [
-       {
-         "Effect": "Allow",
-         "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-         "Resource": "*"
-       }
-     ]
-   }
-   ```
-3. **Siguiente** → nombre `FitExpertBedrock` → **Crear política**.
-
-**3. Volver a publicar** el `.zip` (paso 3C) y abrir la URL. En `/api/salud` debe aparecer
-`asesorIA: Amazon Bedrock · us.amazon.nova-lite-v1:0`.
-
-**4. Usarlo:** ingresar como usuario → hacer o abrir una evaluación → **Mi plan** → **Organizar mi semana con IA**,
-o escribir una pregunta como «¿Qué puedo comer antes de entrenar?».
-
-> En tu computador, el coach necesita credenciales de AWS (`aws configure` con una clave de acceso de IAM). Si no
-> las configuras, todo lo demás funciona y el coach muestra un aviso; pruébalo directamente en Lambda.
->
-> Para usar otro modelo, agrega en Lambda la variable `Bedrock__Modelo`, por ejemplo `us.amazon.nova-micro-v1:0`.
-> Cada consulta consume una fracción muy pequeña de los créditos.
+Si ya tenías la función publicada con Bedrock, puedes eliminar la política insertada `FitExpertBedrock` del rol
+de la función Lambda y la variable `Bedrock__Modelo`; ya no se usan.
 
 ## Solución de problemas
 
@@ -216,8 +199,8 @@ o escribir una pregunta como «¿Qué puedo comer antes de entrenar?».
 | Error sobre ICU o globalización | Agregar la variable de entorno `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT` con valor `1`. |
 | `Login failed` | Usuario o contraseña de la cadena de conexión incorrectos. |
 | La sesión se cierra sola al poco tiempo | Falta la variable `Jwt__Clave` en Lambda (paso 3D.2). |
-| El coach dice que no tiene permiso para usar Bedrock | Falta la política `FitExpertBedrock` en el rol de la función (paso 3E.2). |
-| El coach rechaza el modelo | Revisa `Bedrock__Modelo` o déjala vacía para usar Nova Lite. |
+| `Invalid object name 'NodoDecision'` o `'DetalleHipotesis'` | Falta ejecutar la versión nueva de `FitExpertDB_AWS.sql` (paso 3A.7). |
+| «La base de conocimiento no es coherente» al evaluar | Se desactivó o editó a mano una regla de un nodo terminal; vuelve a ejecutar `FitExpertDB_AWS.sql`. |
 | `Invalid object name 'Usuario'` | Falta ejecutar `FitExpert_Login_AWS.sql` (paso 3D.1). |
 
 ## Cuidar los créditos
@@ -235,8 +218,8 @@ o escribir una pregunta como «¿Qué puedo comer antes de entrenar?».
 | 0:00 – 0:45 | Portada del proyecto | Presentación, integrantes y objetivo de la actividad |
 | 0:45 – 1:45 | Consola de AWS, plan Free y créditos | Cómo se creó la cuenta y por qué el plan Free no genera cobros |
 | 1:45 – 3:15 | Catálogo de IA: Bedrock, SageMaker, Lex, Comprehend | Recorrido por los servicios; ninguno ejecuta una base de reglas como la del proyecto, por eso el SE se publica como servicio propio |
-| 3:15 – 4:45 | RDS creada y SSMS ejecutando el script | La base de conocimiento: preguntas, hechos, hipótesis, pesos y la vista `vw_Reglas` con las 26 reglas |
-| 4:45 – 6:00 | Visual Studio: `FitExpert.Web` y `Program.cs` | El motor de inferencia es el mismo de clase; se expone con `/api/preguntas`, `/api/reglas` y `/api/evaluar` |
+| 3:15 – 4:45 | RDS creada y SSMS ejecutando el script | La base de conocimiento: árbol de decisión (`NodoDecision`), hipótesis, reglas con sus pesos y la vista `vw_Reglas` con las 27 reglas |
+| 4:45 – 6:00 | Visual Studio: `FitExpert.Web` y `Program.cs` | El motor de inferencia es el mismo de clase; se expone con `/api/app/arbol`, `/api/app/evaluar` y `/api/admin/reglas` |
 | 6:00 – 7:00 | Lambda: subir el .zip, variable de entorno, Function URL | Cómo se publica el servicio sin servidores y cómo se conecta con RDS |
-| 7:00 – 9:00 | Interfaz web en la URL de Lambda | Responder el cuestionario, generar la recomendación, abrir la explicación, mostrar la pestaña de reglas y `/api/salud` |
+| 7:00 – 9:00 | Interfaz web en la URL de Lambda | Recorrer el árbol, generar la recomendación, abrir el detalle de las hipótesis, mostrar la pestaña de reglas y `/api/salud` |
 | 9:00 – 9:30 | Cierre | Separación entre base de conocimiento, motor e interfaz; el SE se consume como servicio desde cualquier cliente |

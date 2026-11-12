@@ -30,8 +30,7 @@
     flecha: '<path d="M5 12h14M13 6l6 6-6 6"/>',
     atras: '<path d="M19 12H5M11 6l-6 6 6 6"/>',
     mas: '<path d="M12 5v14M5 12h14"/>',
-    chispa: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/>',
-    enviar: '<path d="M4 12l16-8-6 16-2-7z"/>'
+    arbol: '<circle cx="12" cy="4" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="12" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 6v13M12 11H5v6M12 11h7v6"/>'
   };
 
   function svg(nombre) {
@@ -100,7 +99,7 @@
   const CLAVE_SESION = "fitexpert.sesion";
   const estado = {
     token: null, usuario: null, perfil: "USUARIO",
-    preguntas: [], respuestas: {}, paso: 0, plan: null, historial: []
+    arbol: null, camino: [], plan: null, historial: [], detalles: {}
   };
 
   function guardarSesion(sesion) {
@@ -121,8 +120,8 @@
     estado.token = null;
     estado.usuario = null;
     estado.plan = null;
-    estado.respuestas = {};
-    estado.paso = 0;
+    estado.camino = [];
+    estado.detalles = {};
     estado.historial = [];
     try { localStorage.removeItem(CLAVE_SESION); } catch { /* sin almacenamiento */ }
     mostrarPantalla("login");
@@ -305,7 +304,7 @@
           el("div", {},
             el("span", { class: "etiqueta" }, "Empieza aquí"),
             el("h2", {}, "Aún no tienes un plan"),
-            el("p", {}, "Responde 9 preguntas y el sistema experto armará tu rutina y tu dieta.")),
+            el("p", {}, "Responde las preguntas del árbol de decisión y el sistema experto armará tu rutina y tu dieta.")),
           el("button", { class: "boton primario", onclick: () => irUsuario("evaluacion") }, "Hacer evaluación", icono("flecha")));
 
     const datos = el("div", { class: "rejilla tres" },
@@ -356,14 +355,19 @@
   }
 
   // ------------------------------------------------------------- evaluación
+  // La evaluación recorre el árbol de decisión de la base de conocimiento
+  // (tabla NodoDecision): cada respuesta lleva al nodo hijo, hasta llegar
+  // a un nodo terminal con su hipótesis (H1 a H26).
   async function renderEvaluacion() {
     const vista = $("#vista-evaluacion");
-    if (!estado.preguntas.length) {
-      poner(vista, cargando("Consultando la base de conocimiento…"));
+    if (!estado.arbol) {
+      poner(vista, cargando("Consultando el árbol de decisión…"));
       try {
-        estado.preguntas = await api("/api/app/preguntas");
+        const arbol = await api("/api/app/arbol");
+        const nodos = new Map(arbol.nodos.map((n) => [n.idNodo, n]));
+        estado.arbol = { raiz: arbol.raiz, nodos, profundidad: new Map() };
       } catch (error) {
-        poner(vista, estadoVacio("pulso", "No se pudo cargar el cuestionario", error.message,
+        poner(vista, estadoVacio("pulso", "No se pudo cargar el árbol de decisión", error.message,
           el("button", { class: "boton primario", onclick: () => renderEvaluacion() }, "Reintentar")));
         return;
       }
@@ -371,67 +375,111 @@
     renderPaso();
   }
 
+  /** Nodo en el que está el usuario según las respuestas dadas. */
+  function nodoActual() {
+    const ultimo = estado.camino[estado.camino.length - 1];
+    return estado.arbol.nodos.get(ultimo ? ultimo.idNodoDestino : estado.arbol.raiz);
+  }
+
+  /** Preguntas que faltan, como máximo, desde un nodo hasta un nodo terminal. */
+  function preguntasRestantes(idNodo) {
+    const memo = estado.arbol.profundidad;
+    if (memo.has(idNodo)) return memo.get(idNodo);
+    const nodo = estado.arbol.nodos.get(idNodo);
+    const valor = nodo.tipo === "TERMINAL" ? 0 : 1 + Math.max(...nodo.opciones.map((o) => preguntasRestantes(o.idNodoDestino)));
+    memo.set(idNodo, valor);
+    return valor;
+  }
+
+  function responder(nodo, opcion) {
+    estado.camino.push({ idNodo: nodo.idNodo, codigoNodo: nodo.codigo, pregunta: nodo.pregunta.texto, idHecho: opcion.idHecho, texto: opcion.texto, idNodoDestino: opcion.idNodoDestino });
+    renderPaso();
+  }
+
   function renderPaso() {
     const vista = $("#vista-evaluacion");
-    const total = estado.preguntas.length;
-    const pregunta = estado.preguntas[estado.paso];
-    const elegida = estado.respuestas[pregunta.idPregunta];
-    const respondidas = Object.keys(estado.respuestas).length;
-    const esUltima = estado.paso === total - 1;
+    const nodo = nodoActual();
+    const respondidas = estado.camino.length;
+    const total = respondidas + preguntasRestantes(nodo.idNodo);
+    const avance = total ? (respondidas / total) * 100 : 100;
 
-    const opciones = el("div", { class: "opciones" }, pregunta.opciones.map((opcion, i) =>
-      el("button", {
-        class: "opcion" + (elegida === opcion.idHecho ? " elegida" : ""),
-        type: "button",
-        onclick: () => {
-          estado.respuestas[pregunta.idPregunta] = opcion.idHecho;
-          if (!esUltima) {
-            const pasoActual = estado.paso;
-            renderPaso();
-            setTimeout(() => {
-              if (estado.paso === pasoActual && estado.paso < total - 1) { estado.paso++; renderPaso(); }
-            }, 220);
-          } else {
-            renderPaso();
-          }
-        }
-      }, el("span", { class: "letra" }, String.fromCharCode(65 + i)), opcion.texto)));
+    const atras = el("button", {
+      class: "boton fantasma", type: "button", disabled: respondidas === 0,
+      onclick: () => { estado.camino.pop(); renderPaso(); }
+    }, icono("atras"), "Atrás");
 
-    const atras = el("button", { class: "boton fantasma", type: "button", disabled: estado.paso === 0, onclick: () => { estado.paso--; renderPaso(); } }, icono("atras"), "Atrás");
-    const siguiente = esUltima
-      ? el("button", { class: "boton primario", type: "button", disabled: respondidas < total, onclick: generarPlan }, "Ver mi plan", icono("flecha"))
-      : el("button", { class: "boton primario", type: "button", disabled: elegida === undefined && pregunta.obligatoria, onclick: () => { estado.paso++; renderPaso(); } }, "Siguiente", icono("flecha"));
+    const recorrido = respondidas
+      ? el("ol", { class: "recorrido" }, estado.camino.map((p) =>
+          el("li", {}, el("span", { class: "nodo" }, p.codigoNodo), el("span", {}, p.pregunta), el("b", {}, p.texto))))
+      : null;
 
-    const puntos = el("div", { class: "puntos" }, estado.preguntas.map((p, i) =>
-      el("i", { class: (estado.respuestas[p.idPregunta] !== undefined ? "lleno" : "") + (i === estado.paso ? " actual" : "") })));
+    let cuerpo;
+    if (nodo.tipo === "DECISION") {
+      cuerpo = [
+        el("span", { class: "pregunta-num" }, `${nodo.codigo} · ${nodo.pregunta.codigo}`),
+        el("h2", { class: "pregunta-texto" }, nodo.pregunta.texto),
+        nodo.pregunta.ayuda ? el("p", { class: "pregunta-ayuda" }, nodo.pregunta.ayuda) : null,
+        el("div", { class: "opciones" }, nodo.opciones.map((opcion, i) =>
+          el("button", { class: "opcion", type: "button", onclick: () => responder(nodo, opcion) },
+            el("span", { class: "letra" }, String.fromCharCode(65 + i)), opcion.texto))),
+        el("div", { class: "asistente-acciones" }, atras, el("span"))
+      ];
+    } else if (nodo.hipotesis.aviso) {
+      // Condición de riesgo: el recorrido concluye aquí y se remite a un profesional de la salud.
+      cuerpo = [
+        el("span", { class: "pregunta-num" }, `Nodo terminal ${nodo.codigo}`),
+        el("h2", { class: "pregunta-texto" }, `${nodo.hipotesis.codigo} · ${nodo.hipotesis.nombre}`),
+        el("div", { class: "chips", style: "margin-bottom:18px" }, chipArea(nodo.hipotesis.area)),
+        avisoSalud(nodo.hipotesis.aviso),
+        el("p", { class: "pregunta-ayuda", style: "margin-top:16px" }, "La evaluación termina aquí. Al finalizar se guardará en tu historial junto con la regla que la justifica."),
+        el("div", { class: "asistente-acciones" }, atras,
+          el("button", { class: "boton primario", type: "button", onclick: generarPlan }, "Entendido, finalizar evaluación", icono("check")))
+      ];
+    } else {
+      cuerpo = [
+        el("span", { class: "pregunta-num" }, `Nodo terminal ${nodo.codigo}`),
+        el("h2", { class: "pregunta-texto" }, `${nodo.hipotesis.codigo} · ${nodo.hipotesis.nombre}`),
+        el("div", { class: "chips", style: "margin-bottom:18px" }, chipArea(nodo.hipotesis.area)),
+        el("p", { class: "pregunta-ayuda" }, "Llegaste al final del árbol de decisión. El motor de inferencia evaluará las reglas con tus respuestas y mostrará las 5 hipótesis con mayor puntuación."),
+        el("div", { class: "asistente-acciones" }, atras,
+          el("button", { class: "boton primario", type: "button", onclick: generarPlan }, "Ver mi plan", icono("flecha")))
+      ];
+    }
 
     poner(vista, el("div", { class: "asistente" },
       el("div", { class: "asistente-cabecera" },
-        el("span", {}, `Pregunta ${estado.paso + 1} de ${total}`),
-        el("span", {}, `${Math.round((respondidas / total) * 100)} % completado`)),
-      el("div", { class: "barra-fina" }, el("i", { style: `width:${(respondidas / total) * 100}%` })),
-      el("span", { class: "pregunta-num" }, pregunta.codigo),
-      el("h2", { class: "pregunta-texto" }, pregunta.texto),
-      opciones,
-      el("div", { class: "asistente-acciones" }, atras, siguiente),
-      puntos));
+        el("span", {}, nodo.tipo === "DECISION" ? `Pregunta ${respondidas + 1}` : "Recorrido completo"),
+        el("span", {}, `${Math.round(avance)} % completado`)),
+      el("div", { class: "barra-fina" }, el("i", { style: `width:${avance}%` })),
+      cuerpo,
+      recorrido ? el("h3", { class: "seccion" }, "Tu recorrido en el árbol") : null,
+      recorrido));
+  }
+
+  /** Aviso obligatorio de las condiciones de riesgo (texto de la base de conocimiento). */
+  function avisoSalud(texto) {
+    return el("div", { class: "aviso-salud", role: "alert" },
+      el("span", { class: "ico-aviso", icono: "escudo" }),
+      el("div", {},
+        el("b", {}, "Consulta con un profesional de la salud"),
+        el("p", {}, texto)));
   }
 
   async function generarPlan(evento) {
     const boton = evento.currentTarget;
+    const textoBoton = boton.textContent;
     boton.disabled = true;
     boton.textContent = "Analizando tu perfil…";
     try {
-      const hechos = estado.preguntas.map((p) => estado.respuestas[p.idPregunta]).filter((id) => id !== undefined);
+      const hechos = estado.camino.map((p) => p.idHecho);
       estado.plan = await api("/api/app/evaluar", { metodo: "POST", cuerpo: { hechos } });
-      estado.respuestas = {};
-      estado.paso = 0;
+      estado.camino = [];
       avisar("¡Plan generado! Revisa tu rutina y tu dieta.");
       irUsuario("plan");
     } catch (error) {
       avisar(error.message, true);
       boton.disabled = false;
-      boton.textContent = "Ver mi plan";
+      boton.textContent = textoBoton;
     }
   }
 
@@ -439,7 +487,6 @@
   async function abrirEvaluacion(id) {
     try {
       estado.plan = await api(`/api/app/evaluaciones/${id}`);
-      estado.plan.idEvaluacion = id;
       irUsuario("plan");
     } catch (error) {
       avisar(error.message, true);
@@ -474,115 +521,79 @@
       el("div", {},
         el("div", { class: "chips" }, chipArea(principal.area),
           el("span", { class: "chip" }, `Prioridad ${principal.prioridad}`),
-          el("span", { class: "chip" }, `Cobertura ${principal.cobertura} %`)),
+          el("span", { class: "chip" }, `Nodo ${plan.nodoTerminal}`)),
         el("h2", {}, `${principal.codigo} · ${principal.nombre}`),
         el("p", { class: "tenue" }, `Evaluación del ${fechaLarga(plan.fecha)} · ${plan.hipotesisEvaluadas} hipótesis analizadas`)));
 
+    const riesgo = Boolean(principal.aviso);
     const bloques = el("div", { class: "rejilla dos" },
-      bloquePlan("llama", "Tu rutina", principal.rutina),
-      bloquePlan("plato", "Tu alimentación", principal.dieta));
+      bloquePlan("llama", riesgo ? "Rutina (solo con autorización del profesional)" : "Tu rutina", principal.rutina),
+      bloquePlan("plato", riesgo ? "Alimentación (solo con autorización del profesional)" : "Tu alimentación", principal.dieta));
 
     const porque = el("div", { class: "tarjeta bloque-plan porque" },
       el("div", { class: "cabecera-bloque" }, el("span", { class: "ico-dato", icono: "bombilla" }), el("h3", {}, "¿Por qué este plan?")),
       el("div", { class: "regla" }, principal.regla),
       el("p", {}, principal.explicacion));
 
+    // Al dar clic en una hipótesis se consulta su detalle en la tabla DetalleHipotesis.
     const alternativas = el("div", { class: "linea-tiempo" }, otras.map((h) => {
+      const detalle = el("div", { class: "detalle" });
       const tarjeta = el("div", { class: "tarjeta alternativa" },
         el("span", { class: "pos" }, String(h.posicion)),
         el("div", {},
           el("b", {}, `${h.codigo} · ${h.nombre}`),
           el("div", { class: "barra-fina" }, el("i", { style: `width:${Math.min(100, h.peso)}%` }))),
         el("span", { class: "pct" }, `${numero(h.peso)}%`),
-        el("div", { class: "detalle" },
-          chipArea(h.area),
-          el("h4", {}, "Rutina"), el("p", {}, h.rutina),
-          el("h4", {}, "Dieta"), el("p", {}, h.dieta),
-          el("h4", {}, "Regla"), el("p", {}, h.regla)));
-      tarjeta.addEventListener("click", () => tarjeta.classList.toggle("abierta"));
+        detalle);
+      tarjeta.addEventListener("click", async () => {
+        const abrir = !tarjeta.classList.contains("abierta");
+        tarjeta.classList.toggle("abierta", abrir);
+        if (abrir && !detalle.childElementCount) {
+          poner(detalle, el("p", {}, "Consultando el detalle…"));
+          try {
+            const d = await obtenerDetalle(plan.idEvaluacion, h.posicion);
+            poner(detalle,
+              el("div", { class: "chips" }, chipArea(d.area),
+                el("span", { class: "chip" }, `Cobertura ${numero(d.cobertura)} %`),
+                el("span", { class: "chip" }, `Condiciones cumplidas ${numero(d.condicionesCumplidas)} %`)),
+              el("h4", {}, "Rutina"), el("p", {}, d.rutina),
+              el("h4", {}, "Dieta"), el("p", {}, d.dieta),
+              el("h4", {}, `Regla ${d.codigoRegla}`), el("div", { class: "regla" }, d.regla),
+              el("h4", {}, "Explicación"), el("p", {}, d.explicacion));
+          } catch (error) {
+            poner(detalle, el("p", {}, error.message));
+          }
+        }
+      });
       return tarjeta;
     }));
 
-    poner(vista, 
+    const recorrido = el("ol", { class: "recorrido" }, (plan.recorrido || []).map((p) =>
+      el("li", {}, el("span", { class: "nodo" }, p.nodo), el("span", {}, p.pregunta), el("b", {}, p.respuesta))));
+
+    poner(vista,
       el("h1", { class: "titulo" }, "Mi ", el("span", {}, "plan")),
-      el("p", { class: "subtitulo" }, "Recomendación del motor de inferencia según tu perfil."),
+      el("p", { class: "subtitulo" }, "Recomendación del motor de inferencia según tu recorrido en el árbol de decisión."),
       cabecera,
-      el("h2", { class: "seccion" }, "Tu programa"),
+      riesgo ? el("h2", { class: "seccion" }, "Aviso importante") : null,
+      riesgo ? avisoSalud(principal.aviso) : null,
+      el("h2", { class: "seccion" }, riesgo ? "Orientación para revisar con tu profesional" : "Tu programa"),
       bloques,
       el("h2", { class: "seccion" }, "Explicación"),
       porque,
-      el("h2", { class: "seccion" }, "Tu coach de IA"),
-      plan.idEvaluacion ? crearCoach(plan.idEvaluacion) : null,
-      otras.length ? el("h2", { class: "seccion" }, "Otras opciones compatibles") : null,
+      otras.length ? el("h2", { class: "seccion" }, "Otras hipótesis con mayor puntuación") : null,
       alternativas,
-      el("h2", { class: "seccion" }, "Lo que declaraste"),
-      el("div", { class: "chips" }, (plan.hechosDeclarados || []).map((h) => el("span", { class: "chip" }, h))),
+      el("h2", { class: "seccion" }, "Tu recorrido en el árbol"),
+      recorrido,
       el("p", { class: "tenue", style: "margin-top:26px;font-size:13px" },
         "Orientación académica: no sustituye la valoración de un profesional de la salud o del deporte."));
   }
 
-  // ------------------------------------------------------------- coach IA (Amazon Bedrock)
-  /** Convierte el texto del coach en párrafos y viñetas, siempre como texto. */
-  function textoCoach(texto) {
-    const contenedor = el("div", { class: "coach-texto" });
-    let lista = null;
-    texto.split(/\r?\n/).map((l) => l.replace(/\*\*/g, "").replace(/^#+\s*/, "").trim()).forEach((linea) => {
-      if (!linea) { lista = null; return; }
-      const vineta = linea.match(/^[-•*]\s+(.*)$/);
-      if (vineta) {
-        if (!lista) { lista = el("ul"); contenedor.append(lista); }
-        lista.append(el("li", {}, vineta[1]));
-      } else {
-        lista = null;
-        contenedor.append(el("p", {}, linea));
-      }
-    });
-    return contenedor;
-  }
-
-  function crearCoach(idEvaluacion) {
-    const conversacion = el("div", { class: "coach-conversacion" });
-    const campo = el("input", { type: "text", maxlength: "300", placeholder: "Pregúntale algo a tu coach sobre este plan…" });
-    const botonPlan = el("button", { class: "boton primario", type: "button" }, icono("chispa"), "Organizar mi semana con IA");
-    const botonEnviar = el("button", { class: "boton fantasma", type: "submit", "aria-label": "Enviar pregunta" }, icono("enviar"));
-
-    async function consultar(pregunta) {
-      const burbujaUsuario = pregunta ? el("div", { class: "burbuja usuario" }, pregunta) : null;
-      const espera = el("div", { class: "burbuja coach pensando" }, el("span"), el("span"), el("span"));
-      if (burbujaUsuario) conversacion.append(burbujaUsuario);
-      conversacion.append(espera);
-      botonPlan.disabled = botonEnviar.disabled = true;
-      try {
-        const r = await api("/api/app/coach", { metodo: "POST", cuerpo: { idEvaluacion, pregunta: pregunta || null } });
-        espera.replaceWith(el("div", { class: "burbuja coach" }, textoCoach(r.respuesta),
-          el("small", {}, `Generado con Amazon Bedrock · ${r.modelo}`)));
-      } catch (error) {
-        espera.replaceWith(el("div", { class: "burbuja coach error-coach" }, error.message));
-      } finally {
-        botonPlan.disabled = botonEnviar.disabled = false;
-      }
-    }
-
-    botonPlan.addEventListener("click", () => consultar(null));
-    const formulario = el("form", { class: "coach-pregunta" }, campo, botonEnviar);
-    formulario.addEventListener("submit", (evento) => {
-      evento.preventDefault();
-      const pregunta = campo.value.trim();
-      if (!pregunta) return;
-      campo.value = "";
-      consultar(pregunta);
-    });
-
-    return el("div", { class: "tarjeta coach" },
-      el("div", { class: "coach-cabecera" },
-        el("span", { class: "ico-dato", icono: "chispa" }),
-        el("div", {},
-          el("h3", {}, "FitCoach"),
-          el("p", { class: "tenue", style: "margin:0;font-size:13px" },
-            "Inteligencia artificial de Amazon Bedrock. Explica el plan que eligió el sistema experto; no lo cambia."))),
-      botonPlan,
-      conversacion,
-      formulario);
+  async function obtenerDetalle(idEvaluacion, posicion) {
+    const clave = `${idEvaluacion}-${posicion}`;
+    if (!estado.detalles[clave])
+      estado.detalles[clave] = await api(`/api/app/evaluaciones/${idEvaluacion}/hipotesis/${posicion}`);
+    return estado.detalles[clave];
   }
 
   function bloquePlan(nombreIcono, titulo, texto) {
@@ -629,7 +640,7 @@
     $$("#nav-admin button").forEach((b) => b.classList.toggle("activo", b.dataset.vista === vista));
     $$("#pantalla-admin .vista").forEach((v) => v.classList.toggle("activa", v.id === "vista-" + vista));
     window.scrollTo({ top: 0 });
-    ({ resumen: renderResumen, reglas: renderReglas, hipotesis: renderHipotesis, usuarios: renderUsuarios })[vista]();
+    ({ resumen: renderResumen, arbol: renderArbolAdmin, reglas: renderReglas, hipotesis: renderHipotesis, usuarios: renderUsuarios })[vista]();
   }
   $$("#nav-admin button").forEach((b) => b.addEventListener("click", () => irAdmin(b.dataset.vista)));
 
@@ -675,7 +686,7 @@
   async function renderReglas() {
     const vista = $("#vista-reglas");
     const cabecera = encabezadoAdmin("Base de", "conocimiento",
-      "Reglas de producción SI … Y … ENTONCES almacenadas en Amazon RDS (vista vw_Reglas).");
+      "Reglas de producción SI … Y … ENTONCES: una por cada nodo terminal del árbol (tablas Regla y CondicionRegla).");
     poner(vista, ...cabecera, cargando("Consultando reglas…"));
 
     try {
@@ -684,10 +695,11 @@
       const pintar = (filtro = "") => {
         const texto = filtro.trim().toLowerCase();
         cuerpo.replaceChildren(...reglas
-          .filter((r) => !texto || `${r.hipotesis} ${r.regla} ${r.area}`.toLowerCase().includes(texto))
+          .filter((r) => !texto || `${r.regla} ${r.hipotesis} ${r.texto} ${r.area}`.toLowerCase().includes(texto))
           .map((r) => el("tr", {},
+            el("td", {}, el("b", {}, r.regla)),
             el("td", {}, el("b", {}, r.hipotesis)),
-            el("td", {}, r.regla),
+            el("td", {}, r.texto),
             el("td", {}, chipArea(r.area)),
             el("td", {}, String(r.prioridad)),
             el("td", {}, String(r.condiciones)))));
@@ -701,10 +713,37 @@
         el("div", { class: "herramientas" }, buscador,
           el("span", { class: "tenue", style: "margin:0" }, `${reglas.length} reglas · ${reglas.reduce((s, r) => s + r.condiciones, 0)} condiciones`)),
         el("div", { class: "tabla-envoltura" }, el("table", {},
-          el("thead", {}, el("tr", {}, ["Hipótesis", "Regla", "Área", "Prioridad", "Condiciones"].map((t) => el("th", {}, t)))),
+          el("thead", {}, el("tr", {}, ["Regla", "Hipótesis", "SI … ENTONCES", "Área", "Prioridad", "Condiciones"].map((t) => el("th", {}, t)))),
           cuerpo)));
     } catch (error) {
       poner(vista, ...cabecera, estadoVacio("reglas", "No se pudieron cargar las reglas", error.message, null));
+    }
+  }
+
+  async function renderArbolAdmin() {
+    const vista = $("#vista-arbol");
+    const cabecera = encabezadoAdmin("Árbol de", "decisión",
+      "Estructura que recorre el usuario en la evaluación (tabla NodoDecision). Cada rama es una respuesta.");
+    poner(vista, ...cabecera, cargando("Consultando el árbol…"));
+
+    try {
+      const arbol = await api("/api/admin/arbol");
+      const nodos = new Map(arbol.nodos.map((n) => [n.idNodo, n]));
+      const decision = arbol.nodos.filter((n) => n.tipo === "DECISION").length;
+
+      const pintarNodo = (nodo) => nodo.tipo === "TERMINAL"
+        ? el("div", { class: "nodo-arbol terminal" },
+            el("span", { class: "codigo" }, nodo.codigo), el("b", {}, `${nodo.hipotesis.codigo} · ${nodo.hipotesis.nombre}`), chipArea(nodo.hipotesis.area))
+        : el("div", { class: "nodo-arbol" },
+            el("div", { class: "nodo-pregunta" }, el("span", { class: "codigo" }, nodo.codigo), el("b", {}, nodo.pregunta.texto)),
+            el("ul", {}, nodo.opciones.map((o) =>
+              el("li", {}, el("span", { class: "rama" }, o.texto), pintarNodo(nodos.get(o.idNodoDestino))))));
+
+      poner(vista, ...cabecera,
+        el("p", { class: "tenue" }, `${arbol.nodos.length} nodos · ${decision} de decisión · ${arbol.nodos.length - decision} terminales · ${arbol.nodos.length - 1} ramas`),
+        el("div", { class: "tarjeta arbol" }, pintarNodo(nodos.get(arbol.raiz))));
+    } catch (error) {
+      poner(vista, ...cabecera, estadoVacio("arbol", "No se pudo cargar el árbol", error.message, null));
     }
   }
 

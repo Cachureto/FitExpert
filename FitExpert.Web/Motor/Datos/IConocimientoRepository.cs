@@ -8,14 +8,14 @@ namespace FitExpert.Motor.Datos;
 /// </summary>
 public interface IConocimientoRepository
 {
-    /// <summary>Consulta 1: preguntas con sus hechos, para construir el formulario.</summary>
-    IReadOnlyList<Pregunta> ObtenerPreguntas();
+    /// <summary>Consulta 1: arbol de decision con sus preguntas, respuestas e hipotesis.</summary>
+    ArbolDecision ObtenerArbol();
 
-    /// <summary>Consulta 2: hipotesis vinculadas a alguno de los hechos declarados.</summary>
-    IReadOnlyList<Hipotesis> ObtenerHipotesisCandidatas(IEnumerable<int> idsHechos);
+    /// <summary>Consulta 2: reglas activas con alguna condicion entre los hechos declarados.</summary>
+    IReadOnlyList<Regla> ObtenerReglasCandidatas(IEnumerable<int> idsHechos);
 
-    /// <summary>Consulta 3: todos los hechos que respaldan una hipotesis.</summary>
-    IReadOnlyList<VinculoHechoHipotesis> ObtenerVinculosDeHipotesis(int idHipotesis);
+    /// <summary>Consulta 3: condiciones (parte SI) de una regla.</summary>
+    IReadOnlyList<CondicionRegla> ObtenerCondicionesDeRegla(int idRegla);
 
     int ConsultasEjecutadas { get; }
 }

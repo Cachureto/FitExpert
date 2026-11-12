@@ -201,30 +201,28 @@ a:hover { text-decoration: underline; }
 .alternativa .detalle h4 { margin: 8px 0 2px; color: var(--texto); font-size: 13px; }
 .alternativa .detalle p { margin: 0; }
 
-/* ------------------------------------------------------------- coach IA */
-.coach { display: grid; gap: 16px; background: radial-gradient(circle at 100% 0%, rgba(59, 130, 246, .16), transparent 50%), var(--superficie); }
-.coach-cabecera { display: flex; gap: 12px; align-items: center; }
-.coach-cabecera .ico-dato { width: 42px; height: 42px; border-radius: 12px; background: rgba(59, 130, 246, .16); color: #60a5fa; display: flex; align-items: center; justify-content: center; flex: none; }
-.coach-cabecera h3 { margin: 0; font-size: 17px; }
-.coach > .boton { justify-self: start; }
-.coach-conversacion { display: grid; gap: 10px; }
-.coach-conversacion:empty { display: none; }
-.burbuja { max-width: 92%; padding: 14px 16px; border-radius: 16px; line-height: 1.55; font-size: 14px; }
-.burbuja.usuario { justify-self: end; background: var(--acento); color: #fff; border-bottom-right-radius: 4px; }
-.burbuja.coach { justify-self: start; background: var(--superficie-2); border: 1px solid var(--borde); border-bottom-left-radius: 4px; }
-.burbuja.coach small { display: block; margin-top: 10px; color: var(--texto-3); font-size: 11px; }
-.burbuja.error-coach { border-color: rgba(225, 29, 46, .5); color: var(--acento-2); }
-.coach-texto p { margin: 0 0 8px; }
-.coach-texto ul { margin: 0 0 8px; padding-left: 18px; }
-.coach-texto li { margin-bottom: 4px; }
-.pensando { display: flex; gap: 6px; }
-.pensando span { width: 8px; height: 8px; border-radius: 50%; background: var(--texto-3); animation: latido 1s infinite ease-in-out; }
-.pensando span:nth-child(2) { animation-delay: .15s; }
-.pensando span:nth-child(3) { animation-delay: .3s; }
-@keyframes latido { 0%, 100% { opacity: .3; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-3px); } }
-.coach-pregunta { display: flex; gap: 8px; }
-.coach-pregunta input { margin: 0; }
-.coach-pregunta .boton { padding: 0 16px; flex: none; }
+/* ------------------------------------------------------------- recorrido del arbol */
+.pregunta-ayuda { color: var(--texto-2); font-size: 14px; margin: -12px 0 20px; line-height: 1.5; }
+.recorrido { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; counter-reset: paso; }
+.recorrido li { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; background: var(--superficie); border: 1px solid var(--borde); border-radius: 12px; padding: 10px 14px; font-size: 14px; color: var(--texto-2); }
+.recorrido li b { color: var(--texto); text-align: right; }
+.recorrido .nodo, .nodo-arbol .codigo { font-family: var(--display); font-size: 16px; letter-spacing: .5px; color: var(--acento-2); }
+@media (max-width: 640px) { .recorrido li { grid-template-columns: auto 1fr; } .recorrido li b { grid-column: 1 / -1; text-align: left; } }
+
+.aviso-salud { display: flex; gap: 14px; align-items: flex-start; padding: 18px 20px; border-radius: 16px; background: rgba(245, 158, 11, .12); border: 1px solid rgba(245, 158, 11, .55); color: var(--texto); }
+.aviso-salud .ico-aviso { width: 40px; height: 40px; border-radius: 12px; background: rgba(245, 158, 11, .2); color: #f59e0b; display: flex; align-items: center; justify-content: center; flex: none; }
+.aviso-salud .ico-aviso svg { width: 22px; height: 22px; }
+.aviso-salud b { display: block; font-size: 16px; margin-bottom: 4px; color: #fbbf24; }
+.aviso-salud p { margin: 0; line-height: 1.55; color: var(--texto); }
+
+/* ------------------------------------------------------------- arbol (admin) */
+.arbol { overflow-x: auto; }
+.nodo-arbol { display: flex; flex-direction: column; gap: 8px; }
+.nodo-arbol .nodo-pregunta { display: flex; gap: 10px; align-items: baseline; }
+.nodo-arbol.terminal { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 10px; }
+.nodo-arbol ul { list-style: none; margin: 0 0 0 10px; padding: 0 0 0 18px; border-left: 2px solid var(--borde); display: grid; gap: 10px; }
+.nodo-arbol li { display: grid; gap: 6px; }
+.nodo-arbol .rama { font-size: 12px; font-weight: 700; color: var(--texto-3); text-transform: uppercase; letter-spacing: .6px; }
 
 /* ------------------------------------------------------------- historial */
 .linea-tiempo { display: grid; gap: 10px; }

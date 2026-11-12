@@ -2,14 +2,26 @@
    FitExpert - Base de conocimiento para Amazon RDS for SQL Server
    Ejecutar desde SSMS conectado al endpoint de RDS con el usuario
    maestro (admin). Crea la base FitExpertDB si no existe y luego las
-   tablas, los datos y las vistas.
-       Pregunta        preguntas que el sistema formula al usuario
-       Hecho           respuestas posibles de cada pregunta
-       Hipotesis       conclusiones del sistema (H1 a H26)
-       HechoHipotesis  vinculos hecho-hipotesis con su peso
-       vw_Reglas       reglas SI ... Y ... ENTONCES de la base de conocimiento
-       Usuario         cuentas de acceso (usuario final y administrador)
-       Evaluacion      historial de evaluaciones
+   tablas, los datos y las vistas. Si se ejecuta de nuevo, recrea todo
+   (se pierde el historial de evaluaciones).
+
+   BASE DE CONOCIMIENTO
+       Pregunta          nodos de decision: lo que el sistema pregunta
+       Hecho             respuestas posibles de cada pregunta (ramas)
+       Hipotesis         conclusiones del sistema (H1 a H26)
+       NodoDecision      arbol de decision (relacion recursiva al padre).
+                         La interfaz recorre ESTE arbol: cada respuesta
+                         lleva al nodo hijo, hasta un nodo terminal Hn.
+       Regla             una regla por cada nodo terminal (R01 a R27)
+       CondicionRegla    parte SI de cada regla: los hechos del camino
+                         desde la raiz hasta el nodo terminal, con su peso
+
+   TRANSACCIONAL
+       Usuario           cuentas de acceso (usuario final y administrador)
+       Evaluacion        cada ejecucion del motor de inferencia
+       EvaluacionRespuesta  camino recorrido en el arbol (pregunta y respuesta)
+       DetalleHipotesis  detalle de las 5 hipotesis con mayor puntuacion:
+                         rutina, dieta, regla y explicacion de cada una
    ===================================================================== */
 
 IF DB_ID(N'FitExpertDB') IS NULL
@@ -18,22 +30,30 @@ GO
 USE FitExpertDB;
 GO
 
-DROP TABLE IF EXISTS Evaluacion;
-DROP TABLE IF EXISTS Usuario;
 DROP VIEW  IF EXISTS vw_Reglas;
 DROP VIEW  IF EXISTS vw_HechosPorHipotesis;
-DROP TABLE IF EXISTS HechoHipotesis;
+DROP VIEW  IF EXISTS vw_ArbolDecision;
+DROP TABLE IF EXISTS DetalleHipotesis;
+DROP TABLE IF EXISTS EvaluacionRespuesta;
+DROP TABLE IF EXISTS Evaluacion;
+DROP TABLE IF EXISTS Usuario;
+DROP TABLE IF EXISTS CondicionRegla;
+DROP TABLE IF EXISTS Regla;
+DROP TABLE IF EXISTS NodoDecision;
+DROP TABLE IF EXISTS HechoHipotesis;   -- tabla de la version anterior
 DROP TABLE IF EXISTS Hecho;
 DROP TABLE IF EXISTS Hipotesis;
 DROP TABLE IF EXISTS Pregunta;
 GO
 
+/* =====================================================================
+   BASE DE CONOCIMIENTO
+   ===================================================================== */
 CREATE TABLE Pregunta (
     IdPregunta  INT IDENTITY(1,1) CONSTRAINT PK_Pregunta PRIMARY KEY,
     Codigo      NVARCHAR(10)  NOT NULL CONSTRAINT UQ_Pregunta_Codigo UNIQUE,
     Texto       NVARCHAR(200) NOT NULL,
-    Orden       INT           NOT NULL,
-    Obligatoria BIT           NOT NULL CONSTRAINT DF_Pregunta_Obligatoria DEFAULT (1)
+    Ayuda       NVARCHAR(200) NULL
 );
 
 CREATE TABLE Hecho (
@@ -53,54 +73,83 @@ CREATE TABLE Hipotesis (
                   CHECK (Area IN (N'SEGURIDAD', N'DISPONIBILIDAD', N'RECUPERACION', N'RESTRICCION', N'ENTRENAMIENTO')),
     Prioridad     INT           NOT NULL CONSTRAINT CK_Hipotesis_Prioridad CHECK (Prioridad BETWEEN 1 AND 100),
     Rutina        NVARCHAR(400) NOT NULL,
-    Dieta         NVARCHAR(400) NOT NULL
+    Dieta         NVARCHAR(400) NOT NULL,
+    -- Aviso obligatorio. Si existe, el recorrido concluye en esta hipotesis:
+    -- no se presentan alternativas y se remite al usuario a un profesional.
+    Aviso         NVARCHAR(400) NULL
 );
 
-CREATE TABLE HechoHipotesis (
-    IdHecho     INT NOT NULL CONSTRAINT FK_HH_Hecho     REFERENCES Hecho(IdHecho),
-    IdHipotesis INT NOT NULL CONSTRAINT FK_HH_Hipotesis REFERENCES Hipotesis(IdHipotesis),
-    Peso        DECIMAL(4,2) NOT NULL CONSTRAINT CK_HH_Peso CHECK (Peso > 0 AND Peso <= 1),
-    Necesario   BIT NOT NULL CONSTRAINT DF_HH_Necesario DEFAULT (0),
-    CONSTRAINT PK_HechoHipotesis PRIMARY KEY (IdHecho, IdHipotesis)
+/* Arbol de decision. Un nodo de decision formula una Pregunta; un nodo
+   terminal concluye una Hipotesis. IdHechoRama es la respuesta del nodo
+   padre que conduce a este nodo (la etiqueta de la rama). */
+CREATE TABLE NodoDecision (
+    IdNodo       INT          NOT NULL CONSTRAINT PK_NodoDecision PRIMARY KEY,
+    Codigo       NVARCHAR(5)  NOT NULL CONSTRAINT UQ_NodoDecision_Codigo UNIQUE,
+    IdNodoPadre  INT          NULL CONSTRAINT FK_Nodo_Padre     REFERENCES NodoDecision(IdNodo),
+    IdHechoRama  INT          NULL CONSTRAINT FK_Nodo_Hecho     REFERENCES Hecho(IdHecho),
+    IdPregunta   INT          NULL CONSTRAINT FK_Nodo_Pregunta  REFERENCES Pregunta(IdPregunta),
+    IdHipotesis  INT          NULL CONSTRAINT FK_Nodo_Hipotesis REFERENCES Hipotesis(IdHipotesis),
+    CONSTRAINT CK_Nodo_Tipo CHECK ((IdPregunta IS NOT NULL AND IdHipotesis IS NULL)
+                                OR (IdPregunta IS NULL AND IdHipotesis IS NOT NULL)),
+    CONSTRAINT CK_Nodo_Rama CHECK ((IdNodoPadre IS NULL AND IdHechoRama IS NULL)
+                                OR (IdNodoPadre IS NOT NULL AND IdHechoRama IS NOT NULL)),
+    CONSTRAINT UQ_Nodo_Rama UNIQUE (IdNodoPadre, IdHechoRama)
+);
+
+/* Una regla por nodo terminal: el camino del arbol es la regla. */
+CREATE TABLE Regla (
+    IdRegla        INT IDENTITY(1,1) CONSTRAINT PK_Regla PRIMARY KEY,
+    Codigo         NVARCHAR(5) NOT NULL CONSTRAINT UQ_Regla_Codigo UNIQUE,
+    IdHipotesis    INT NOT NULL CONSTRAINT FK_Regla_Hipotesis REFERENCES Hipotesis(IdHipotesis),
+    IdNodoTerminal INT NOT NULL CONSTRAINT FK_Regla_Nodo REFERENCES NodoDecision(IdNodo)
+                   CONSTRAINT UQ_Regla_Nodo UNIQUE,
+    Activa         BIT NOT NULL CONSTRAINT DF_Regla_Activa DEFAULT (1)
+);
+
+/* Parte SI de cada regla. Orden = profundidad en el arbol. El peso crece
+   con la profundidad: la condicion mas especifica aporta mas evidencia. */
+CREATE TABLE CondicionRegla (
+    IdRegla  INT NOT NULL CONSTRAINT FK_CR_Regla REFERENCES Regla(IdRegla),
+    IdHecho  INT NOT NULL CONSTRAINT FK_CR_Hecho REFERENCES Hecho(IdHecho),
+    Orden    INT NOT NULL,
+    Peso     DECIMAL(4,2) NOT NULL CONSTRAINT CK_CR_Peso CHECK (Peso > 0 AND Peso <= 1),
+    CONSTRAINT PK_CondicionRegla PRIMARY KEY (IdRegla, IdHecho)
 );
 GO
 
-INSERT INTO Pregunta (Codigo, Texto, Orden) VALUES
-    (N'P1', N'¿Tiene alguna condición médica grave diagnosticada?', 1),
-    (N'P2', N'¿En qué rango de edad se encuentra?', 2),
-    (N'P3', N'¿Cuántos días por semana puede entrenar?', 3),
-    (N'P4', N'¿Cuánto tiempo tiene disponible por sesión?', 4),
-    (N'P5', N'¿Cómo califica su nivel de fatiga actual?', 5),
-    (N'P6', N'¿Cuántas horas duerme en promedio por noche?', 6),
-    (N'P7', N'¿Tiene alguna restricción física o lesión?', 7),
-    (N'P8', N'¿Cuál es su objetivo principal?', 8),
-    (N'P9', N'¿Cuál es su nivel de experiencia entrenando?', 9);
+/* ------------------------------------------------------------ preguntas */
+INSERT INTO Pregunta (Codigo, Texto, Ayuda) VALUES
+    (N'P1', N'¿Presenta alguna condición de riesgo para entrenar?', N'Se considera condición de riesgo: una condición médica grave diagnosticada, tener menos de 16 años o tener 60 años o más.'),
+    (N'P2', N'¿Qué tipo de condición presenta?', NULL),
+    (N'P3', N'¿Cuál es su disponibilidad para entrenar?', N'Se necesita al menos 1 día por semana y sesiones de 15 minutos o más para un plan estructurado.'),
+    (N'P4', N'¿Cómo califica su nivel de fatiga actual?', NULL),
+    (N'P5', N'¿Cuántas horas duerme en promedio por noche?', NULL),
+    (N'P6', N'¿Tiene alguna restricción física o lesión?', NULL),
+    (N'P7', N'¿En qué zona se presenta la restricción?', NULL),
+    (N'P8', N'¿Cuál es su objetivo principal?', NULL),
+    (N'P9', N'¿Cuál es su nivel de experiencia entrenando?', NULL);
 
+/* ------------------------------------------------------------ hechos (ramas) */
 INSERT INTO Hecho (IdPregunta, Codigo, Texto, Enunciado, Orden) VALUES
-    (1, N'F_MED_SI', N'Sí, tengo una condición médica diagnosticada', N'tiene una condición médica grave', 1),
-    (1, N'F_MED_NO', N'No tengo ninguna condición médica', N'no tiene condición médica', 2),
-    (2, N'F_EDAD_MENOR16', N'Menos de 16 años', N'es menor de 16 años', 1),
-    (2, N'F_EDAD_ADULTO', N'Entre 16 y 59 años', N'tiene entre 16 y 59 años', 2),
-    (2, N'F_EDAD_60MAS', N'60 años o más', N'tiene 60 años o más', 3),
-    (3, N'F_DIAS_0', N'Menos de 1 día', N'dispone de menos de 1 día por semana', 1),
-    (3, N'F_DIAS_1A2', N'1 o 2 días', N'dispone de 1 a 2 días por semana', 2),
-    (3, N'F_DIAS_3A4', N'3 o 4 días', N'dispone de 3 a 4 días por semana', 3),
-    (3, N'F_DIAS_5MAS', N'5 días o más', N'dispone de 5 días o más por semana', 4),
-    (4, N'F_TIEMPO_MENOS15', N'Menos de 15 minutos', N'dispone de menos de 15 minutos por sesión', 1),
-    (4, N'F_TIEMPO_15A29', N'Entre 15 y 29 minutos', N'dispone de 15 a 29 minutos por sesión', 2),
-    (4, N'F_TIEMPO_30A60', N'Entre 30 y 60 minutos', N'dispone de 30 a 60 minutos por sesión', 3),
-    (4, N'F_TIEMPO_MAS60', N'Más de 60 minutos', N'dispone de más de 60 minutos por sesión', 4),
-    (5, N'F_FATIGA_BAJA', N'Baja, me siento con energía', N'tiene fatiga baja', 1),
-    (5, N'F_FATIGA_MOD', N'Moderada', N'tiene fatiga moderada', 2),
-    (5, N'F_FATIGA_ALTA', N'Alta, me siento agotado', N'tiene fatiga alta', 3),
-    (6, N'F_SUENO_MENOS5', N'Menos de 5 horas', N'duerme menos de 5 horas', 1),
-    (6, N'F_SUENO_5A6', N'Entre 5 y 6 horas', N'duerme entre 5 y 6 horas', 2),
-    (6, N'F_SUENO_7MAS', N'7 horas o más', N'duerme 7 horas o más', 3),
-    (7, N'F_REST_NO', N'No tengo restricciones', N'no tiene restricciones físicas', 1),
-    (7, N'F_REST_RODILLA', N'Sí, en la rodilla', N'tiene una restricción en la rodilla', 2),
-    (7, N'F_REST_HOMBRO', N'Sí, en el hombro', N'tiene una restricción en el hombro', 3),
-    (7, N'F_REST_LUMBAR', N'Sí, en la zona lumbar', N'tiene una restricción lumbar', 4),
-    (7, N'F_REST_OTRA', N'Sí, en otra zona', N'tiene una restricción en otra zona', 5),
+    (1, N'F_RIESGO_SI', N'Sí, presento una condición de riesgo', N'presenta una condición de riesgo', 1),
+    (1, N'F_RIESGO_NO', N'No presento ninguna condición de riesgo', N'no presenta condiciones de riesgo', 2),
+    (2, N'F_COND_MEDICA', N'Condición médica grave diagnosticada', N'tiene una condición médica grave diagnosticada', 1),
+    (2, N'F_COND_MENOR16', N'Tengo menos de 16 años', N'es menor de 16 años', 2),
+    (2, N'F_COND_60MAS', N'Tengo 60 años o más', N'tiene 60 años o más', 3),
+    (3, N'F_DISP_MENOS1DIA', N'Menos de 1 día por semana', N'dispone de menos de 1 día por semana', 1),
+    (3, N'F_DISP_MENOS15MIN', N'Sesiones de menos de 15 minutos', N'dispone de sesiones de menos de 15 minutos', 2),
+    (3, N'F_DISP_SUFICIENTE', N'1 día o más por semana y sesiones de 15 minutos o más', N'tiene disponibilidad suficiente', 3),
+    (4, N'F_FATIGA_ALTA', N'Alta, me siento agotado', N'tiene fatiga alta', 1),
+    (4, N'F_FATIGA_MOD', N'Moderada', N'tiene fatiga moderada', 2),
+    (4, N'F_FATIGA_BAJA', N'Baja, me siento con energía', N'tiene fatiga baja', 3),
+    (5, N'F_SUENO_MENOS5', N'Menos de 5 horas', N'duerme menos de 5 horas', 1),
+    (5, N'F_SUENO_5MAS', N'5 horas o más', N'duerme 5 horas o más', 2),
+    (6, N'F_REST_SI', N'Sí, tengo una restricción o lesión', N'tiene una restricción física', 1),
+    (6, N'F_REST_NO', N'No tengo restricciones', N'no tiene restricciones físicas', 2),
+    (7, N'F_ZONA_RODILLA', N'Rodilla', N'tiene la restricción en la rodilla', 1),
+    (7, N'F_ZONA_HOMBRO', N'Hombro', N'tiene la restricción en el hombro', 2),
+    (7, N'F_ZONA_LUMBAR', N'Zona lumbar', N'tiene la restricción en la zona lumbar', 3),
+    (7, N'F_ZONA_OTRA', N'Otra zona', N'tiene la restricción en otra zona', 4),
     (8, N'F_OBJ_MASA', N'Ganar masa muscular', N'su objetivo es ganar masa muscular', 1),
     (8, N'F_OBJ_FUERZA', N'Aumentar fuerza', N'su objetivo es aumentar fuerza', 2),
     (8, N'F_OBJ_RESIS', N'Mejorar resistencia', N'su objetivo es mejorar resistencia', 3),
@@ -110,6 +159,7 @@ INSERT INTO Hecho (IdPregunta, Codigo, Texto, Enunciado, Orden) VALUES
     (9, N'F_NIVEL_INTER', N'Intermedio', N'su nivel es intermedio', 2),
     (9, N'F_NIVEL_AVAN', N'Avanzado', N'su nivel es avanzado', 3);
 
+/* ------------------------------------------------------------ hipotesis */
 INSERT INTO Hipotesis (Codigo, Nombre, Area, Prioridad, Rutina, Dieta) VALUES
     (N'H1', N'Plan de bajo impacto adaptado', N'SEGURIDAD', 100, N'3 días por semana, 30 min, RPE 3-4. 20 min de caminata o bicicleta estática a ritmo conversacional; 2x10-12 de sentarse y levantarse de una silla, remo con banda y elevación de talones; 10 min de movilidad.', N'Calorías de mantenimiento, proteína 1,0-1,2 g/kg. Plato saludable: mitad verduras, un cuarto proteína magra y un cuarto cereal integral. Menos de 5 g de sal al día en 5 comidas pequeñas.'),
     (N'H2', N'Plan juvenil formativo', N'SEGURIDAD', 100, N'3 días por semana, 45-60 min, solo peso corporal. Juego o deporte más 2-3x10-15 de sentadilla, flexión inclinada y plancha de 20-30 s; énfasis en la técnica y sin cargas máximas. 60 min diarios de actividad.', N'Sin restricción calórica, proteína 1,2-1,5 g/kg. Tres comidas y dos meriendas, con 3 porciones de lácteos al día.'),
@@ -138,97 +188,125 @@ INSERT INTO Hipotesis (Codigo, Nombre, Area, Prioridad, Rutina, Dieta) VALUES
     (N'H25', N'Mantener · Intermedio', N'ENTRENAMIENTO', 50, N'Mixto 3 días: dos de fuerza full body 3x8-12 y uno de cardio de 30-40 min.', N'Calorías de mantenimiento, proteína 1,4-1,6 g/kg.'),
     (N'H26', N'Mantener · Avanzado', N'ENTRENAMIENTO', 50, N'Mixto 4 días: dos de fuerza torso-pierna 3-4x6-10 a RPE 7-8, uno de intervalos y uno de zona 2 de 45 min.', N'Calorías de mantenimiento, proteína 1,6 g/kg y carbohidratos según la carga.');
 
-INSERT INTO HechoHipotesis (IdHecho, IdHipotesis, Peso, Necesario) VALUES
-    (1, 1, 1.00, 1),
-    (3, 2, 1.00, 1),
-    (5, 3, 0.80, 1),
-    (2, 3, 0.20, 0),
-    (6, 4, 1.00, 1),
-    (10, 5, 0.80, 1),
-    (7, 5, 0.20, 0),
-    (16, 6, 0.60, 1),
-    (17, 6, 0.40, 1),
-    (15, 7, 0.70, 1),
-    (18, 7, 0.30, 0),
-    (21, 8, 1.00, 1),
-    (22, 9, 1.00, 1),
-    (23, 10, 1.00, 1),
-    (24, 11, 1.00, 1),
-    (25, 12, 0.45, 1),
-    (30, 12, 0.35, 1),
-    (8, 12, 0.12, 0),
-    (12, 12, 0.08, 0),
-    (20, 12, 0.10, 0),
-    (25, 13, 0.45, 1),
-    (31, 13, 0.35, 1),
-    (8, 13, 0.12, 0),
-    (12, 13, 0.08, 0),
-    (20, 13, 0.10, 0),
-    (25, 14, 0.45, 1),
-    (32, 14, 0.35, 1),
-    (9, 14, 0.12, 0),
-    (13, 14, 0.08, 0),
-    (20, 14, 0.10, 0),
-    (26, 15, 0.45, 1),
-    (30, 15, 0.35, 1),
-    (8, 15, 0.12, 0),
-    (12, 15, 0.08, 0),
-    (20, 15, 0.10, 0),
-    (26, 16, 0.45, 1),
-    (31, 16, 0.35, 1),
-    (8, 16, 0.12, 0),
-    (12, 16, 0.08, 0),
-    (20, 16, 0.10, 0),
-    (26, 17, 0.45, 1),
-    (32, 17, 0.35, 1),
-    (9, 17, 0.12, 0),
-    (13, 17, 0.08, 0),
-    (20, 17, 0.10, 0),
-    (27, 18, 0.45, 1),
-    (30, 18, 0.35, 1),
-    (8, 18, 0.12, 0),
-    (12, 18, 0.08, 0),
-    (20, 18, 0.10, 0),
-    (27, 19, 0.45, 1),
-    (31, 19, 0.35, 1),
-    (8, 19, 0.12, 0),
-    (12, 19, 0.08, 0),
-    (20, 19, 0.10, 0),
-    (27, 20, 0.45, 1),
-    (32, 20, 0.35, 1),
-    (9, 20, 0.12, 0),
-    (13, 20, 0.08, 0),
-    (20, 20, 0.10, 0),
-    (28, 21, 0.45, 1),
-    (30, 21, 0.35, 1),
-    (8, 21, 0.12, 0),
-    (12, 21, 0.08, 0),
-    (20, 21, 0.10, 0),
-    (28, 22, 0.45, 1),
-    (31, 22, 0.35, 1),
-    (8, 22, 0.12, 0),
-    (12, 22, 0.08, 0),
-    (20, 22, 0.10, 0),
-    (28, 23, 0.45, 1),
-    (32, 23, 0.35, 1),
-    (9, 23, 0.12, 0),
-    (13, 23, 0.08, 0),
-    (20, 23, 0.10, 0),
-    (29, 24, 0.45, 1),
-    (30, 24, 0.35, 1),
-    (7, 24, 0.12, 0),
-    (12, 24, 0.08, 0),
-    (20, 24, 0.10, 0),
-    (29, 25, 0.45, 1),
-    (31, 25, 0.35, 1),
-    (8, 25, 0.12, 0),
-    (12, 25, 0.08, 0),
-    (20, 25, 0.10, 0),
-    (29, 26, 0.45, 1),
-    (32, 26, 0.35, 1),
-    (9, 26, 0.12, 0),
-    (13, 26, 0.08, 0),
-    (20, 26, 0.10, 0);
+/* Condiciones de riesgo (H1 a H3): el usuario debe consultar directamente
+   con un profesional de la salud y el recorrido termina en esta hipotesis. */
+UPDATE Hipotesis SET Aviso = N'Por tener una condición médica grave diagnosticada, debe consultar directamente con un profesional de la salud antes de realizar cualquier actividad física. La orientación de este resultado solo debe seguirse con su autorización.' WHERE Codigo = N'H1';
+UPDATE Hipotesis SET Aviso = N'Por ser menor de 16 años, debe consultar directamente con un profesional de la salud antes de entrenar. Cualquier actividad debe realizarse solo con su autorización y bajo la supervisión de un adulto responsable o un entrenador.' WHERE Codigo = N'H2';
+UPDATE Hipotesis SET Aviso = N'Por tener 60 años o más, debe consultar directamente con un profesional de la salud para que valore su condición antes de iniciar el plan. La orientación de este resultado solo debe seguirse con su autorización.' WHERE Codigo = N'H3';
+GO
+
+/* ------------------------------------------------------------ arbol de decision
+   13 nodos de decision, 27 nodos terminales y 39 ramas. Se carga con
+   codigos y se traduce a identificadores para que sea facil de leer. */
+DECLARE @arbol TABLE (IdNodo INT, Codigo NVARCHAR(5), IdNodoPadre INT,
+                      Hecho NVARCHAR(30), Pregunta NVARCHAR(10), Hipotesis NVARCHAR(5));
+
+INSERT INTO @arbol (IdNodo, Codigo, IdNodoPadre, Hecho, Pregunta, Hipotesis) VALUES
+    (1, N'N01', NULL, NULL, N'P1', NULL),
+    (2, N'N02', 1, N'F_RIESGO_SI', N'P2', NULL),
+    (3, N'N03', 2, N'F_COND_MEDICA', NULL, N'H1'),
+    (4, N'N04', 2, N'F_COND_MENOR16', NULL, N'H2'),
+    (5, N'N05', 2, N'F_COND_60MAS', NULL, N'H3'),
+    (6, N'N06', 1, N'F_RIESGO_NO', N'P3', NULL),
+    (7, N'N07', 6, N'F_DISP_MENOS1DIA', NULL, N'H4'),
+    (8, N'N08', 6, N'F_DISP_MENOS15MIN', NULL, N'H5'),
+    (9, N'N09', 6, N'F_DISP_SUFICIENTE', N'P4', NULL),
+    (10, N'N10', 9, N'F_FATIGA_ALTA', N'P5', NULL),
+    (11, N'N11', 10, N'F_SUENO_MENOS5', NULL, N'H6'),
+    (12, N'N12', 10, N'F_SUENO_5MAS', NULL, N'H7'),
+    (13, N'N13', 9, N'F_FATIGA_MOD', NULL, N'H7'),
+    (14, N'N14', 9, N'F_FATIGA_BAJA', N'P6', NULL),
+    (15, N'N15', 14, N'F_REST_SI', N'P7', NULL),
+    (16, N'N16', 15, N'F_ZONA_RODILLA', NULL, N'H8'),
+    (17, N'N17', 15, N'F_ZONA_HOMBRO', NULL, N'H9'),
+    (18, N'N18', 15, N'F_ZONA_LUMBAR', NULL, N'H10'),
+    (19, N'N19', 15, N'F_ZONA_OTRA', NULL, N'H11'),
+    (20, N'N20', 14, N'F_REST_NO', N'P8', NULL),
+    (21, N'N21', 20, N'F_OBJ_MASA', N'P9', NULL),
+    (22, N'N22', 21, N'F_NIVEL_PRIN', NULL, N'H12'),
+    (23, N'N23', 21, N'F_NIVEL_INTER', NULL, N'H13'),
+    (24, N'N24', 21, N'F_NIVEL_AVAN', NULL, N'H14'),
+    (25, N'N25', 20, N'F_OBJ_FUERZA', N'P9', NULL),
+    (26, N'N26', 25, N'F_NIVEL_PRIN', NULL, N'H15'),
+    (27, N'N27', 25, N'F_NIVEL_INTER', NULL, N'H16'),
+    (28, N'N28', 25, N'F_NIVEL_AVAN', NULL, N'H17'),
+    (29, N'N29', 20, N'F_OBJ_RESIS', N'P9', NULL),
+    (30, N'N30', 29, N'F_NIVEL_PRIN', NULL, N'H18'),
+    (31, N'N31', 29, N'F_NIVEL_INTER', NULL, N'H19'),
+    (32, N'N32', 29, N'F_NIVEL_AVAN', NULL, N'H20'),
+    (33, N'N33', 20, N'F_OBJ_PESO', N'P9', NULL),
+    (34, N'N34', 33, N'F_NIVEL_PRIN', NULL, N'H21'),
+    (35, N'N35', 33, N'F_NIVEL_INTER', NULL, N'H22'),
+    (36, N'N36', 33, N'F_NIVEL_AVAN', NULL, N'H23'),
+    (37, N'N37', 20, N'F_OBJ_MANTENER', N'P9', NULL),
+    (38, N'N38', 37, N'F_NIVEL_PRIN', NULL, N'H24'),
+    (39, N'N39', 37, N'F_NIVEL_INTER', NULL, N'H25'),
+    (40, N'N40', 37, N'F_NIVEL_AVAN', NULL, N'H26');
+
+INSERT INTO NodoDecision (IdNodo, Codigo, IdNodoPadre, IdHechoRama, IdPregunta, IdHipotesis)
+SELECT a.IdNodo, a.Codigo, a.IdNodoPadre, f.IdHecho, p.IdPregunta, h.IdHipotesis
+FROM @arbol a
+LEFT JOIN Hecho f     ON f.Codigo = a.Hecho
+LEFT JOIN Pregunta p  ON p.Codigo = a.Pregunta
+LEFT JOIN Hipotesis h ON h.Codigo = a.Hipotesis
+ORDER BY a.IdNodo;
+GO
+
+/* ------------------------------------------------------------ reglas
+   R01 a R26 corresponden a H1 a H26. R27 cubre la fatiga alta con 5 o
+   mas horas de sueno, que tambien concluye H7 (semana de descarga). */
+INSERT INTO Regla (Codigo, IdHipotesis, IdNodoTerminal) VALUES
+    (N'R01', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H1'), 3),
+    (N'R02', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H2'), 4),
+    (N'R03', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H3'), 5),
+    (N'R04', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H4'), 7),
+    (N'R05', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H5'), 8),
+    (N'R06', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H6'), 11),
+    (N'R07', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H7'), 13),
+    (N'R08', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H8'), 16),
+    (N'R09', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H9'), 17),
+    (N'R10', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H10'), 18),
+    (N'R11', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H11'), 19),
+    (N'R12', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H12'), 22),
+    (N'R13', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H13'), 23),
+    (N'R14', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H14'), 24),
+    (N'R15', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H15'), 26),
+    (N'R16', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H16'), 27),
+    (N'R17', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H17'), 28),
+    (N'R18', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H18'), 30),
+    (N'R19', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H19'), 31),
+    (N'R20', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H20'), 32),
+    (N'R21', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H21'), 34),
+    (N'R22', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H22'), 35),
+    (N'R23', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H23'), 36),
+    (N'R24', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H24'), 38),
+    (N'R25', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H25'), 39),
+    (N'R26', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H26'), 40),
+    (N'R27', (SELECT IdHipotesis FROM Hipotesis WHERE Codigo = N'H7'), 12);
+GO
+
+/* Condiciones de cada regla: se derivan del camino del arbol, de modo que
+   la regla y el recorrido de la interfaz no pueden diferir. */
+WITH Camino AS (
+    SELECT r.IdRegla, n.IdNodoPadre, n.IdHechoRama, 0 AS Altura
+    FROM Regla r
+    JOIN NodoDecision n ON n.IdNodo = r.IdNodoTerminal
+    UNION ALL
+    SELECT c.IdRegla, p.IdNodoPadre, p.IdHechoRama, c.Altura + 1
+    FROM Camino c
+    JOIN NodoDecision p ON p.IdNodo = c.IdNodoPadre
+    WHERE p.IdHechoRama IS NOT NULL
+),
+Ordenado AS (
+    SELECT IdRegla, IdHechoRama AS IdHecho,
+           COUNT(*) OVER (PARTITION BY IdRegla) - Altura AS Orden,
+           COUNT(*) OVER (PARTITION BY IdRegla)          AS Total
+    FROM Camino
+)
+INSERT INTO CondicionRegla (IdRegla, IdHecho, Orden, Peso)
+SELECT IdRegla, IdHecho, Orden,
+       CAST(ROUND(CAST(Orden AS DECIMAL(9,4)) / (Total * (Total + 1) / 2.0), 2) AS DECIMAL(4,2))
+FROM Ordenado;
 GO
 
 
@@ -236,7 +314,6 @@ GO
    SEGURIDAD E HISTORIAL
    Usuario     cuentas de acceso. La contrasena no se guarda: se guarda su
                derivacion PBKDF2-SHA256 (100 000 iteraciones) y una sal.
-   Evaluacion  historial de evaluaciones de cada usuario final.
    Cuentas iniciales:
        admin    / Admin2026*     -> ADMINISTRADOR (ingeniero del conocimiento)
        usuario  / Usuario2026*   -> USUARIO (usuario final de prueba)
@@ -254,19 +331,6 @@ CREATE TABLE Usuario (
     UltimoAcceso   DATETIME2(0)  NULL
 );
 
-CREATE TABLE Evaluacion (
-    IdEvaluacion    INT IDENTITY(1,1) CONSTRAINT PK_Evaluacion PRIMARY KEY,
-    IdUsuario       INT           NOT NULL CONSTRAINT FK_Evaluacion_Usuario
-                    REFERENCES Usuario (IdUsuario),
-    Fecha           DATETIME2(0)  NOT NULL CONSTRAINT DF_Evaluacion_Fecha DEFAULT (SYSUTCDATETIME()),
-    CodigoHipotesis NVARCHAR(10)  NOT NULL,
-    NombreHipotesis NVARCHAR(80)  NOT NULL,
-    Peso            DECIMAL(5,1)  NOT NULL,
-    Resultado       NVARCHAR(MAX) NOT NULL
-);
-
-CREATE INDEX IX_Evaluacion_Usuario ON Evaluacion (IdUsuario, Fecha DESC);
-
 INSERT INTO Usuario (NombreUsuario, NombreCompleto, Rol, ClaveHash, Sal) VALUES
     (N'admin',   N'Ingeniero del conocimiento', N'ADMINISTRADOR',
      0xD59CCEBBE5F425E5F4E33D82C1BBCE554B9A0B8DE9B2D90681FA3A1C6A3076B7,
@@ -276,34 +340,91 @@ INSERT INTO Usuario (NombreUsuario, NombreCompleto, Rol, ClaveHash, Sal) VALUES
      0x5C9E01B7D24F3A68E1907BC35D2A4F86);
 GO
 
+/* Evaluacion: cada ejecucion del motor de inferencia de un usuario. */
+CREATE TABLE Evaluacion (
+    IdEvaluacion        INT IDENTITY(1,1) CONSTRAINT PK_Evaluacion PRIMARY KEY,
+    IdUsuario           INT           NOT NULL CONSTRAINT FK_Evaluacion_Usuario REFERENCES Usuario (IdUsuario),
+    Fecha               DATETIME2(0)  NOT NULL CONSTRAINT DF_Evaluacion_Fecha DEFAULT (SYSUTCDATETIME()),
+    IdNodoTerminal      INT           NOT NULL CONSTRAINT FK_Evaluacion_Nodo REFERENCES NodoDecision (IdNodo),
+    HipotesisEvaluadas  INT           NOT NULL,
+    ConsultasEjecutadas INT           NOT NULL
+);
+
+CREATE INDEX IX_Evaluacion_Usuario ON Evaluacion (IdUsuario, Fecha DESC);
+
+/* Camino recorrido en el arbol: en cada paso, el nodo de decision que se
+   mostro y la respuesta (hecho) que eligio el usuario. */
+CREATE TABLE EvaluacionRespuesta (
+    IdEvaluacion INT NOT NULL CONSTRAINT FK_ER_Evaluacion REFERENCES Evaluacion (IdEvaluacion) ON DELETE CASCADE,
+    Paso         INT NOT NULL,
+    IdNodo       INT NOT NULL CONSTRAINT FK_ER_Nodo  REFERENCES NodoDecision (IdNodo),
+    IdHecho      INT NOT NULL CONSTRAINT FK_ER_Hecho REFERENCES Hecho (IdHecho),
+    CONSTRAINT PK_EvaluacionRespuesta PRIMARY KEY (IdEvaluacion, Paso)
+);
+
+/* Detalle de las 5 hipotesis con mayor puntuacion de cada evaluacion.
+   Es lo que se muestra al dar clic en una hipotesis: la rutina, la dieta
+   y la regla con sus descripciones. Se guarda una copia del texto para
+   que el historial muestre lo que el usuario vio, aunque despues se
+   edite la base de conocimiento. */
+CREATE TABLE DetalleHipotesis (
+    IdEvaluacion          INT            NOT NULL CONSTRAINT FK_DH_Evaluacion REFERENCES Evaluacion (IdEvaluacion) ON DELETE CASCADE,
+    Posicion              TINYINT        NOT NULL CONSTRAINT CK_DH_Posicion CHECK (Posicion BETWEEN 1 AND 5),
+    IdHipotesis           INT            NOT NULL CONSTRAINT FK_DH_Hipotesis REFERENCES Hipotesis (IdHipotesis),
+    IdRegla               INT            NOT NULL CONSTRAINT FK_DH_Regla REFERENCES Regla (IdRegla),
+    CodigoHipotesis       NVARCHAR(5)    NOT NULL,
+    NombreHipotesis       NVARCHAR(80)   NOT NULL,
+    Area                  NVARCHAR(20)   NOT NULL,
+    Prioridad             INT            NOT NULL,
+    Peso                  DECIMAL(5,1)   NOT NULL,   -- puntuacion normalizada (%) entre las 5
+    Cobertura             DECIMAL(5,1)   NOT NULL,   -- % del peso de la regla cubierto por los hechos
+    CondicionesCumplidas  DECIMAL(5,1)   NOT NULL,   -- % de condiciones de la regla que se cumplen
+    ConclusionArbol       BIT            NOT NULL,   -- 1 = hipotesis a la que llego el recorrido
+    Rutina                NVARCHAR(400)  NOT NULL,   -- descripcion de la rutina
+    Dieta                 NVARCHAR(400)  NOT NULL,   -- descripcion de la dieta
+    CodigoRegla           NVARCHAR(5)    NOT NULL,
+    Regla                 NVARCHAR(800)  NOT NULL,   -- SI ... Y ... ENTONCES ...
+    Explicacion           NVARCHAR(1500) NOT NULL,   -- descripcion de por que se obtuvo la regla
+    Aviso                 NVARCHAR(400)  NULL,       -- aviso de condicion de riesgo (consultar a un profesional)
+    CONSTRAINT PK_DetalleHipotesis PRIMARY KEY (IdEvaluacion, Posicion)
+);
+GO
+
 
 /* =====================================================================
-   VISTA. Reglas en formato SI ... Y ... ENTONCES
-   Se construyen con los hechos necesarios de cada hipotesis.
+   VISTAS
    ===================================================================== */
+
+/* Reglas en formato SI ... Y ... ENTONCES, construidas con CondicionRegla. */
 CREATE OR ALTER VIEW vw_Reglas AS
-SELECT  h.Codigo AS Hipotesis,
+SELECT  r.Codigo AS Regla,
+        h.Codigo AS Hipotesis,
         N'SI el usuario ' +
-        STRING_AGG(f.Enunciado, N' Y ') WITHIN GROUP (ORDER BY f.IdHecho) +
-        N' ENTONCES ' + h.Codigo + N' (' + h.Nombre + N')' AS Regla,
+        STRING_AGG(f.Enunciado, N' Y ') WITHIN GROUP (ORDER BY cr.Orden) +
+        N' ENTONCES ' + h.Codigo + N' (' + h.Nombre + N')' AS Texto,
         h.Area,
         h.Prioridad,
         COUNT(*) AS Condiciones
-FROM Hipotesis h
-JOIN HechoHipotesis hh ON hh.IdHipotesis = h.IdHipotesis AND hh.Necesario = 1
-JOIN Hecho f           ON f.IdHecho = hh.IdHecho
-GROUP BY h.IdHipotesis, h.Codigo, h.Nombre, h.Area, h.Prioridad;
+FROM Regla r
+JOIN Hipotesis h       ON h.IdHipotesis = r.IdHipotesis
+JOIN CondicionRegla cr ON cr.IdRegla = r.IdRegla
+JOIN Hecho f           ON f.IdHecho = cr.IdHecho
+WHERE r.Activa = 1
+GROUP BY r.IdRegla, r.Codigo, h.Codigo, h.Nombre, h.Area, h.Prioridad;
 GO
 
-/* Vista de apoyo: todos los hechos que respaldan cada hipotesis. */
-CREATE OR ALTER VIEW vw_HechosPorHipotesis AS
-SELECT  h.Codigo AS Hipotesis, h.Nombre, h.Area,
-        p.Codigo AS Pregunta, f.Codigo AS Hecho, f.Enunciado,
-        hh.Peso, hh.Necesario
-FROM Hipotesis h
-JOIN HechoHipotesis hh ON hh.IdHipotesis = h.IdHipotesis
-JOIN Hecho f           ON f.IdHecho = hh.IdHecho
-JOIN Pregunta p        ON p.IdPregunta = f.IdPregunta;
+/* Arbol de decision legible: cada nodo con la rama que lo origina. */
+CREATE OR ALTER VIEW vw_ArbolDecision AS
+SELECT  n.Codigo AS Nodo,
+        padre.Codigo AS NodoPadre,
+        f.Texto AS Rama,
+        CASE WHEN n.IdPregunta IS NOT NULL THEN N'DECISION' ELSE N'TERMINAL' END AS Tipo,
+        COALESCE(p.Codigo + N' ' + p.Texto, h.Codigo + N' ' + h.Nombre) AS Contenido
+FROM NodoDecision n
+LEFT JOIN NodoDecision padre ON padre.IdNodo = n.IdNodoPadre
+LEFT JOIN Hecho f            ON f.IdHecho = n.IdHechoRama
+LEFT JOIN Pregunta p         ON p.IdPregunta = n.IdPregunta
+LEFT JOIN Hipotesis h        ON h.IdHipotesis = n.IdHipotesis;
 GO
 
 /* =====================================================================
@@ -312,8 +433,31 @@ GO
 SELECT N'Preguntas' AS Tabla, COUNT(*) AS Registros FROM Pregunta
 UNION ALL SELECT N'Hechos', COUNT(*) FROM Hecho
 UNION ALL SELECT N'Hipotesis', COUNT(*) FROM Hipotesis
-UNION ALL SELECT N'Asociaciones hecho-hipotesis', COUNT(*) FROM HechoHipotesis
+UNION ALL SELECT N'Nodos del arbol', COUNT(*) FROM NodoDecision
+UNION ALL SELECT N'Nodos de decision', COUNT(*) FROM NodoDecision WHERE IdPregunta IS NOT NULL
+UNION ALL SELECT N'Nodos terminales', COUNT(*) FROM NodoDecision WHERE IdHipotesis IS NOT NULL
+UNION ALL SELECT N'Reglas', COUNT(*) FROM Regla
+UNION ALL SELECT N'Condiciones', COUNT(*) FROM CondicionRegla
 UNION ALL SELECT N'Usuarios', COUNT(*) FROM Usuario;
 
-SELECT Hipotesis, Regla, Prioridad FROM vw_Reglas ORDER BY Prioridad DESC, Hipotesis;
+/* Coherencia del arbol: debe devolver 0 filas. Cada rama debe ser una
+   respuesta de la pregunta del nodo padre, y cada pregunta de un nodo
+   debe tener una rama hija por cada una de sus respuestas. */
+SELECT N'Rama que no pertenece a la pregunta del padre' AS Problema, n.Codigo
+FROM NodoDecision n
+JOIN NodoDecision padre ON padre.IdNodo = n.IdNodoPadre
+JOIN Hecho f ON f.IdHecho = n.IdHechoRama
+WHERE f.IdPregunta <> padre.IdPregunta
+UNION ALL
+SELECT N'Respuesta sin rama en el arbol', d.Codigo + N' / ' + f.Codigo
+FROM NodoDecision d
+JOIN Hecho f ON f.IdPregunta = d.IdPregunta
+WHERE NOT EXISTS (SELECT 1 FROM NodoDecision c WHERE c.IdNodoPadre = d.IdNodo AND c.IdHechoRama = f.IdHecho)
+UNION ALL
+SELECT N'Hipotesis sin nodo terminal', h.Codigo
+FROM Hipotesis h
+WHERE NOT EXISTS (SELECT 1 FROM NodoDecision n WHERE n.IdHipotesis = h.IdHipotesis);
+
+SELECT Nodo, NodoPadre, Rama, Tipo, Contenido FROM vw_ArbolDecision ORDER BY Nodo;
+SELECT Regla, Hipotesis, Texto, Prioridad FROM vw_Reglas ORDER BY Regla;
 GO
