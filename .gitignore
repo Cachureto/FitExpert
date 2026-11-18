@@ -5,7 +5,7 @@ publish/
 *.zip
 
 # Configuracion local con contrasenas o cadenas de conexion
-appsettings.Development.json
+appsettings.*.json
 
 # Editores y sistema
 .vs/
